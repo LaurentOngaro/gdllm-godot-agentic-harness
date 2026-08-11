@@ -33,14 +33,10 @@ var _context_probe_serial: int = 0 ## Bumped per probe; a superseded probe's tim
 var _busy: bool = false
 var _completion_est_in: int = 0 ## chars-per-token estimate of the completion request payload (taken in _post), the non-streamed counterpart of _stream_est_in.
 
-## Streaming chat state. HTTPRequest buffers the whole body, so chat runs on a raw HTTPClient polled from _process instead — that's the only way to read Ollama's NDJSON stream (thinking + content) chunk by chunk.
-var _stream_client: HTTPClient
+## Streaming chat state. HTTPRequest buffers the whole body, so chat runs on an owned transport polled from _process instead — that's the only way to read a reply (thinking + content) chunk by chunk. The transport is LLMStreamTransport rather than a raw HTTPClient because HTTPClient reads only the Content-Length and chunked body framings, filing an unframed (connection-delimited) streaming body — the shape koboldcpp's built-in server sends — as empty.
+var _stream_client: LLMStreamTransport
 var _streaming: bool = false
-var _stream_path: String = "" ## Request path, held until the socket is connected.
-var _stream_headers: PackedStringArray
-var _stream_payload: String = ""
-var _stream_request_sent: bool = false ## The POST has been issued (the socket reaches CONNECTED once before the request and once after the body, so we need to tell the two apart).
-var _stream_headers_checked: bool = false
+var _stream_pending_bytes: PackedByteArray = PackedByteArray() ## Body bytes whose trailing UTF-8 sequence may still be incomplete; only the longest cleanly-decodable prefix moves to _stream_buffer, so a codepoint split across two drains never decodes as replacement chars.
 var _stream_buffer: String = "" ## Unparsed tail of the NDJSON body, or the raw body when the response wasn't 200.
 var _stream_content: String = "" ## Assistant content accumulated across chunks; emitted whole via response_received at the end.
 var _stream_tool_calls: Array = [] ## Tool calls collected from the stream (Ollama emits them whole, not token-by-token); when non-empty at the end, tool_calls_received fires instead of response_received.
@@ -54,6 +50,9 @@ var _stream_bad_code: int = 0 ## Non-200 status; _stream_buffer then holds the e
 var _stream_received_body: bool = false ## Any body bytes arrived; tells a socket that closed silent (never answered) from one whose reply this source's wire format didn't recognize.
 var _stream_error: String = "" ## An error field in the stream itself (e.g. bad model); reported verbatim.
 var _stream_connect_elapsed: float = 0.0
+var _stream_sent_seen: int = 0 ## The transport's sent_bytes() at the last _process; an upload that advanced resets the connect clock, so only a stalled one can time out.
+var _stream_saw_event: bool = false ## Some line of the body parsed into at least one adapter event — proof the reply speaks this source's wire format.
+var _stream_idle_elapsed: float = 0.0 ## Seconds since body bytes last arrived; only consulted for replies that can't end themselves (an error status, or a body no line of which parses), where an unframed keep-alive stream may never close.
 var _stream_adapter: LLMAdapter ## Per-request adapter; built in send_chat_request, holds any streaming parse state, dropped on teardown.
 
 
@@ -108,6 +107,13 @@ func _make_adapter() -> LLMAdapter:
 	return LLMAdapter.for_kind(adapter_kind)
 
 
+## The header lines every request to this source carries: JSON content type, plus whatever auth scheme the adapter's provider wants for the configured key.
+func _request_headers(adapter: LLMAdapter) -> PackedStringArray:
+	var headers := PackedStringArray(["Content-Type: application/json"])
+	headers.append_array(adapter.auth_headers(api_key))
+	return headers
+
+
 ## True while a request is in flight. Callers should check this before starting a new request so overlapping requests are ignored.
 func is_busy() -> bool:
 	return _busy
@@ -138,9 +144,7 @@ func fetch_models() -> void:
 		if not _tags_pending:
 			return # the deadline already resolved this fetch as empty while we waited
 	var adapter := _make_adapter()
-	var headers := PackedStringArray(["Content-Type: application/json"])
-	headers.append_array(adapter.auth_headers(api_key))
-	var err := _tags_http_request.request(adapter.normalize_base(api_base) + adapter.models_path(), headers, HTTPClient.METHOD_GET)
+	var err := _tags_http_request.request(adapter.normalize_base(api_base) + adapter.models_path(), _request_headers(adapter), HTTPClient.METHOD_GET)
 	if err != OK:
 		last_models_error = "the request could not be sent (%s)" % error_string(err)
 		push_warning("LLMClient: model list request error: %s" % error_string(err))
@@ -189,7 +193,7 @@ func _kind_404_hint() -> String:
 		return "check the source's URL and Kind: a bare http://host:port, a base ending in /v1, or a full endpoint like …/v1/chat/completions all work for an OpenAI-compatible server — an Ollama server needs the Ollama kind instead"
 	if adapter_kind == GDLLMSources.KIND_ANTHROPIC:
 		return "check the source's URL: Anthropic wants https://api.anthropic.com (pasting the full …/v1/messages endpoint works too)"
-	return "check the source's URL and Kind: an Ollama server takes a bare http://host:port or a full endpoint like …/api/chat — an OpenAI-compatible server (LM Studio, llama.cpp, vLLM, most others...) needs the OpenAI kind instead"
+	return "check the source's URL and Kind: an Ollama server takes a bare http://host:port or a full endpoint like …/api/chat — an OpenAI-compatible server (LM Studio, llama.cpp, koboldcpp, vLLM, most others...) needs the OpenAI kind instead"
 
 
 ## Emit the model list exactly once per fetch, so a late response and the timeout can't both fire models_received (which would double-count the source in a sweep).
@@ -214,10 +218,8 @@ func fetch_context_window() -> bool:
 	_context_model = model
 	# Armed through the main loop for the same reason as the model-list deadline: HTTPRequest's own timeout can't be trusted here, and an unreachable host that never RSTs would otherwise hang the probe forever.
 	(Engine.get_main_loop() as SceneTree).create_timer(GDLLMTunables.getf(GDLLMTunables.MODEL_FETCH_TIMEOUT)).timeout.connect(_on_context_timeout.bind(_context_probe_serial))
-	var headers := PackedStringArray(["Content-Type: application/json"])
-	headers.append_array(adapter.auth_headers(api_key))
 	var body: Dictionary = probe.get("body", {})
-	var err := _context_http_request.request(adapter.normalize_base(api_base) + String(probe.get("path", "")), headers, int(probe.get("method", HTTPClient.METHOD_GET)), JSON.stringify(body) if not body.is_empty() else "")
+	var err := _context_http_request.request(adapter.normalize_base(api_base) + String(probe.get("path", "")), _request_headers(adapter), int(probe.get("method", HTTPClient.METHOD_GET)), JSON.stringify(body) if not body.is_empty() else "")
 	if err != OK:
 		push_warning("LLMClient: context-window probe error: %s" % error_string(err))
 		_emit_context_window(0)
@@ -274,32 +276,23 @@ func send_chat_request(messages: Array, system_prompt: String = "", tools: Array
 	full_messages.append_array(messages)
 	# The adapter builds the provider-specific body (Ollama passthrough, or an OpenAI translation) and holds any streaming parse state for this request.
 	_stream_adapter = _make_adapter()
-	_stream_payload = JSON.stringify(_stream_adapter.build_chat_body(model, full_messages, tools, effort, cache_ttl))
+	var payload := JSON.stringify(_stream_adapter.build_chat_body(model, full_messages, tools, effort, cache_ttl))
 
 	var endpoint := _parse_endpoint()
-	_stream_client = HTTPClient.new()
-	var tls: TLSOptions = TLSOptions.client() if endpoint["use_ssl"] else null
-	var err := _stream_client.connect_to_host(endpoint["host"], endpoint["port"], tls)
-	if err != OK:
-		_stream_client = null
-		request_failed.emit(_endpoint_failure("opening the connection failed (%s)" % error_string(err)))
-		return
+	_stream_client = LLMStreamTransport.new()
+	# Re-prepend the base_url's path (e.g. "/v1") that the endpoint split carved off, so the adapter's bare path lands on the full endpoint. Even an immediately-doomed begin (bad hostname) fails through the transport's state on a later poll, keeping one error path.
+	_stream_client.begin(endpoint["host"], endpoint["port"], TLSOptions.client() if endpoint["use_ssl"] else null, String(endpoint["base_path"]) + _stream_adapter.chat_path(), _request_headers(_stream_adapter), payload)
 
 	_busy = true
 	_streaming = true
-	# Re-prepend the base_url's path (e.g. "/v1") that connect_to_host can't carry, so the adapter's bare path lands on the full endpoint.
-	_stream_path = String(endpoint["base_path"]) + _stream_adapter.chat_path()
-	_stream_headers = PackedStringArray(["Content-Type: application/json"])
-	_stream_headers.append_array(_stream_adapter.auth_headers(api_key))
-	_stream_request_sent = false
-	_stream_headers_checked = false
+	_stream_pending_bytes = PackedByteArray()
 	_stream_buffer = ""
 	_stream_content = ""
 	_stream_tool_calls = []
 	last_assistant_blocks = []
 	_stream_generating = false
 	_stream_stats = {}
-	_stream_est_in = estimate_tokens(_stream_payload.length())
+	_stream_est_in = estimate_tokens(payload.length())
 	_stream_est_out_chars = 0
 	_stream_done = false
 	_stream_stop = ""
@@ -307,61 +300,84 @@ func send_chat_request(messages: Array, system_prompt: String = "", tools: Array
 	_stream_received_body = false
 	_stream_error = ""
 	_stream_connect_elapsed = 0.0
+	_stream_sent_seen = 0
+	_stream_saw_event = false
+	_stream_idle_elapsed = 0.0
 	set_process(true)
 
 
-## Drive the streaming chat socket: connect, POST, then read the NDJSON body chunk by chunk. Runs only between the request and its completion (set_process is toggled around the stream).
+## Drive the streaming chat transport: connect, POST, then read the reply's body chunk by chunk as its own framing delivers it. Runs only between the request and its completion (set_process is toggled around the stream).
 func _process(delta: float) -> void:
 	if not _streaming:
 		return
 	_stream_client.poll()
-	match _stream_client.get_status():
-		HTTPClient.STATUS_RESOLVING, HTTPClient.STATUS_CONNECTING:
-			# Only the pre-request phase is time-boxed; once the model is replying it may think for as long as it likes.
+	match _stream_client.state:
+		LLMStreamTransport.State.RESOLVING, LLMStreamTransport.State.CONNECTING, LLMStreamTransport.State.TLS_HANDSHAKE, LLMStreamTransport.State.SENDING:
+			# The whole pre-response phase is time-boxed — but an upload that is still moving resets the clock, so a slow link only fails once it stalls outright. Once the request is away the model may think for as long as it likes.
+			if _stream_client.state == LLMStreamTransport.State.SENDING and _stream_client.sent_bytes() != _stream_sent_seen:
+				_stream_sent_seen = _stream_client.sent_bytes()
+				_stream_connect_elapsed = 0.0
 			_stream_connect_elapsed += delta
 			if _stream_connect_elapsed > GDLLMTunables.getf(GDLLMTunables.STREAM_CONNECT_TIMEOUT):
 				_fail_stream(_endpoint_failure("it didn't answer within %ss" % GDLLMTunables.getf(GDLLMTunables.STREAM_CONNECT_TIMEOUT)))
-		HTTPClient.STATUS_REQUESTING:
-			pass # request in flight; waiting on the response headers
-		HTTPClient.STATUS_CONNECTED:
-			if not _stream_request_sent:
-				var err := _stream_client.request(HTTPClient.METHOD_POST, _stream_path, _stream_headers, _stream_payload)
-				if err != OK:
-					_fail_stream("Sending the request to %s failed (%s)." % [api_base, error_string(err)])
-				else:
-					_stream_request_sent = true
-			else:
-				# Body fully read and the socket went back to keep-alive without a done:true — wrap up with what we have.
-				_finish_stream()
-		HTTPClient.STATUS_BODY:
+		LLMStreamTransport.State.WAITING:
+			pass # request away; waiting on the response headers (prompt processing lives here — no timeout)
+		LLMStreamTransport.State.BODY:
 			_read_stream_body()
 			if _stream_done:
 				_finish_stream()
+			elif _stream_bad_code != 0 or (_stream_received_body and not _stream_saw_event):
+				# A reply that can't end itself: an error status, or body bytes no line of which parses as this wire format. Either may ride an unframed keep-alive stream whose close never comes (Connection: close ignored — koboldcpp holds its socket open), and neither can produce the done event that ends a healthy turn — so idle time since the last byte caps the wait. Generation silence never lands here: a healthy stream's bytes arrive as parsed events.
+				_stream_idle_elapsed += delta
+				if _stream_idle_elapsed > GDLLMTunables.getf(GDLLMTunables.STREAM_CONNECT_TIMEOUT):
+					_finish_stream()
+		LLMStreamTransport.State.DONE:
+			# The body ended by its own framing's rule — a terminal chunk, the promised length, or (for an unframed stream) the socket closing. Drain the tail, then wrap up with what we have; _finish_stream tells a finished reply from a cut-off one by the adapter's done event, not by how the bytes stopped.
+			_read_stream_body()
+			_finish_stream()
+		LLMStreamTransport.State.FAILED:
+			_fail_stream(_transport_failure())
 		_:
-			# The socket dropped. If we already saw the response and it was 200, treat a close as end-of-stream and finish with what we have — some OpenAI-compatible servers close rather than returning to keep-alive. Otherwise it's a genuine mid-request failure.
-			if _stream_headers_checked and _stream_bad_code == 0:
-				_finish_stream()
-			else:
-				_fail_stream(_stream_status_failure(_stream_client.get_status()))
+			# IDLE is unreachable while _streaming; any state this match doesn't know is a bug that would otherwise spin silently forever.
+			_fail_stream("The connection to %s failed (unexpected transport state %d)." % [api_base, _stream_client.state])
 
 
-## Drain whatever body bytes are ready this frame and parse any complete NDJSON lines out of the buffer.
+## Drain whatever body bytes the transport has decoded this frame and parse any complete NDJSON lines out of the buffer. Bytes stage through _stream_pending_bytes so a UTF-8 sequence split across two drains decodes whole instead of as replacement chars at both ends.
 func _read_stream_body() -> void:
-	if not _stream_headers_checked and _stream_client.has_response():
-		_stream_headers_checked = true
-		var code := _stream_client.get_response_code()
-		if code != 200:
-			_stream_bad_code = code
-	# read_response_body_chunk errors ("status != STATUS_BODY") if called once the body is done, which a small non-streamed body (e.g. a 404 error page) can hit within a single poll — re-check the status each pass so we stop the instant it leaves STATUS_BODY.
-	while _stream_client.get_status() == HTTPClient.STATUS_BODY:
-		var chunk := _stream_client.read_response_body_chunk()
-		if chunk.size() == 0:
-			break
+	if _stream_client.response_code != 0 and _stream_client.response_code != 200:
+		_stream_bad_code = _stream_client.response_code
+	var chunk := _stream_client.read_chunk()
+	if chunk.size() > 0:
 		_stream_received_body = true
-		_stream_buffer += chunk.get_string_from_utf8()
+		_stream_idle_elapsed = 0.0
+		_stream_pending_bytes.append_array(chunk)
+		var complete := _utf8_complete_prefix(_stream_pending_bytes)
+		if complete > 0:
+			_stream_buffer += _stream_pending_bytes.slice(0, complete).get_string_from_utf8()
+			_stream_pending_bytes = _stream_pending_bytes.slice(complete)
 	# On a non-200 the body is an error message, not NDJSON; keep it whole for the failure report.
 	if _stream_bad_code == 0:
 		_parse_stream_lines()
+
+
+## The longest prefix of `bytes` that ends on a complete UTF-8 sequence — everything, unless the tail is a partial multi-byte codepoint still awaiting its continuation bytes. A malformed tail (no lead byte within reach) counts as complete; the decoder's replacement char is then the honest reading.
+static func _utf8_complete_prefix(bytes: PackedByteArray) -> int:
+	var size := bytes.size()
+	var i := size - 1
+	while i >= 0 and i >= size - 3:
+		var b := bytes[i]
+		if b < 0x80:
+			return size # tail ends on ASCII; nothing pending
+		if b >= 0xC0:
+			# A lead byte: its high bits say how many bytes the sequence needs.
+			var need := 2
+			if b >= 0xF0:
+				need = 4
+			elif b >= 0xE0:
+				need = 3
+			return size if size - i >= need else i
+		i -= 1 # a continuation byte; keep walking back toward its lead
+	return size
 
 
 ## Pull each newline-terminated JSON object out of the buffer, leaving any partial trailing line for the next frame.
@@ -384,6 +400,7 @@ func _handle_stream_line(line: String) -> void:
 
 ## Fold one canonical stream event into state: emit thinking, accumulate content (firing generating_started on the first byte), collect tool calls, and capture the terminal stats or error.
 func _apply_stream_event(event: Dictionary) -> void:
+	_stream_saw_event = true
 	match String(event.get("type", "")):
 		"thinking":
 			var thinking := String(event.get("text", ""))
@@ -419,6 +436,13 @@ func _apply_stream_event(event: Dictionary) -> void:
 func _finish_stream() -> void:
 	if not _streaming:
 		return
+	# Flush the decode pipeline before judging the outcome. Held-back bytes decode now — an incomplete trailing sequence's replacement char is the honest reading, since its continuation bytes will never come — and a final line the socket closed without terminating still yields its events, often the terminal marker itself, whose loss would stamp a finished reply truncated.
+	if _stream_pending_bytes.size() > 0:
+		_stream_buffer += _stream_pending_bytes.get_string_from_utf8()
+		_stream_pending_bytes = PackedByteArray()
+	if _stream_bad_code == 0 and _stream_buffer.strip_edges() != "":
+		_handle_stream_line(_stream_buffer.strip_edges())
+		_stream_buffer = ""
 	_teardown_stream()
 	if _stream_error != "":
 		request_failed.emit(_stream_error + _effort_hint(_stream_error))
@@ -487,24 +511,26 @@ func _endpoint_failure(cause: String) -> String:
 	return "Can't reach %s: %s. Check the source's endpoint in the Connections dialog." % [api_base, cause]
 
 
-## A dead stream's failure message from its terminal HTTPClient status, naming the actual cause (bad hostname, refused connect, TLS failure) instead of a bare enum integer.
-func _stream_status_failure(status: int) -> String:
-	match status:
-		HTTPClient.STATUS_CANT_RESOLVE:
+## A dead stream's failure message from the transport's failure kind, naming the actual cause (bad hostname, refused connect, TLS failure) instead of a bare enum integer.
+func _transport_failure() -> String:
+	match _stream_client.fail_kind:
+		LLMStreamTransport.Fail.RESOLVE:
 			return _endpoint_failure("the hostname didn't resolve")
-		HTTPClient.STATUS_CANT_CONNECT:
+		LLMStreamTransport.Fail.CONNECT:
 			return _endpoint_failure("nothing accepted the connection")
-		HTTPClient.STATUS_TLS_HANDSHAKE_ERROR:
+		LLMStreamTransport.Fail.TLS:
 			return _endpoint_failure("the TLS handshake failed")
-		HTTPClient.STATUS_DISCONNECTED:
+		LLMStreamTransport.Fail.CLOSED_BEFORE_REPLY:
 			return "%s closed the connection before replying." % api_base
-		HTTPClient.STATUS_CONNECTION_ERROR:
+		LLMStreamTransport.Fail.BROKE_MID_REQUEST:
 			return "The connection to %s broke mid-request." % api_base
+		LLMStreamTransport.Fail.BAD_RESPONSE:
+			return "%s answered with something that isn't HTTP — check that the source's endpoint in the Connections dialog really is the model API. It begins: %s" % [api_base, _body_excerpt(_stream_client.fail_detail)]
 		_:
-			return "The connection to %s failed (HTTPClient status %d)." % [api_base, status]
+			return "The connection to %s failed (transport failure %d)." % [api_base, _stream_client.fail_kind]
 
 
-## _stream_status_failure's counterpart for the non-streamed HTTPRequest path, mapping its Result enum the same way.
+## _transport_failure's counterpart for the non-streamed HTTPRequest path, mapping its Result enum the same way.
 func _request_result_failure(result: int) -> String:
 	match result:
 		HTTPRequest.RESULT_CANT_RESOLVE:
@@ -557,7 +583,7 @@ func _teardown_stream() -> void:
 		_stream_client = null
 
 
-## Split `api_base` into the pieces HTTPClient.connect_to_host needs. Accepts "http(s)://host[:port][/path]"; the port defaults to the scheme's standard when omitted. `base_path` is the leading path segment of the base_url (e.g. "/v1" for an OpenAI-compatible endpoint, "" when none) — connect_to_host takes only host+port, so the streaming path must re-prepend it or the request drops the segment and 404s.
+## Split `api_base` into the pieces the streaming transport needs. Accepts "http(s)://host[:port][/path]"; the port defaults to the scheme's standard when omitted. `base_path` is the leading path segment of the base_url (e.g. "/v1" for an OpenAI-compatible endpoint, "" when none) — the transport connects by host+port alone, so the streaming path must re-prepend it or the request drops the segment and 404s.
 func _parse_endpoint() -> Dictionary:
 	var base := _make_adapter().normalize_base(api_base)
 	var use_ssl := base.begins_with("https://")
@@ -589,9 +615,7 @@ func _post(path: String, payload: String) -> void:
 	_busy = true
 	_completion_est_in = estimate_tokens(payload.length())
 	var adapter := _make_adapter()
-	var headers := PackedStringArray(["Content-Type: application/json"])
-	headers.append_array(adapter.auth_headers(api_key))
-	var err := http_request.request(adapter.normalize_base(api_base) + path, headers, HTTPClient.METHOD_POST, payload)
+	var err := http_request.request(adapter.normalize_base(api_base) + path, _request_headers(adapter), HTTPClient.METHOD_POST, payload)
 	if err != OK:
 		_busy = false
 		request_failed.emit(_endpoint_failure("sending the request failed (%s)" % error_string(err)))

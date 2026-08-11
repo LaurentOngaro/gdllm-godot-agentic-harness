@@ -607,7 +607,7 @@ func _ensure_connections_dialog() -> void:
 	content.add_theme_constant_override("separation", 8)
 
 	var hint := Label.new()
-	hint.text = "Each source is a place models come from. Kind sets the wire format: Ollama (local or cloud), OpenAI-compatible (LM Studio, llama.cpp, vLLM, Poolside, most others...), or Anthropic (Claude models). For the URL, paste what your provider hands you — the full endpoint or just the server's address; every route is derived from it. Paste an API key for sources that need one — keys are stored locally in Editor Settings and never committed. Save, then Refresh Models to pull each source's models into the pickers."
+	hint.text = "Each source is a place models come from. Kind sets the wire format: Ollama (local or cloud), OpenAI-compatible (LM Studio, llama.cpp, koboldcpp, vLLM, Poolside, most others...), or Anthropic (Claude models). For the URL, paste what your provider hands you — the full endpoint or just the server's address; every route is derived from it. Paste an API key for sources that need one — keys are stored locally in Editor Settings and never committed. Save, then Refresh Models to pull each source's models into the pickers."
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	content.add_child(hint)
 
@@ -1514,6 +1514,7 @@ func _delete_session(id: String) -> void:
 	if _open_sessions.has(id):
 		var session: GDLLMChatSession = _open_sessions[id]
 		_open_sessions.erase(id)
+		session.abort_in_flight() # same unwind the tab-close path does — freeing mid-request would strand the transport's resolver slot and resume coroutines into a dead node
 		session.queue_free()
 	_store.delete(id)
 	_rebuild_session_dropdown()
