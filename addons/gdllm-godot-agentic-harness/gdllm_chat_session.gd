@@ -84,6 +84,17 @@ const LIVE_TOOL_VERBS := {
 	"describe_docs": "reading docs…",
 }
 
+## Seconds an active condensed fold line may sit before it gains a ticking "(Ns)" timer (see _tick_fold_timer); a quick call settles before the timer ever shows.
+const FOLD_TIMER_SECONDS := 2.0
+
+## Past → present-progressive first words of condensed summaries ("Read x" → "Reading x…"): a pair opens wearing the progressive form and settles to the past tense when its result lands (see _open_tool_pair / _close_tool_pair). A summary opening with anything unmapped keeps its wording and just gains the ellipsis (see _pretty_progressive).
+const PROGRESSIVE_VERBS := {
+	"Read": "Reading", "Searched": "Searching", "Listed": "Listing", "Described": "Describing",
+	"Checked": "Checking", "Opened": "Opening", "Edited": "Editing", "Wrote": "Writing",
+	"Created": "Creating", "Moved": "Moving", "Renamed": "Renaming", "Copied": "Copying",
+	"Deleted": "Deleting", "Ran": "Running", "Used": "Using", "Stopped": "Stopping", "Set": "Setting",
+}
+
 var session_id: String ## Stable id of the session this view backs; set via setup().
 var client: LLMClient ## Persistent client for this session's conversation.
 var _qualified_model: String = "" ## This session's model identity as a "source::model" id; the client's endpoint/key/wire-format/bare-model are derived from it (see _apply_qualified_model). The picker, record, and per-turn stamps all carry this, never the bare client.model.
@@ -152,6 +163,9 @@ var _compaction_focus: String = "" ## The focus the in-flight summarization is r
 var _over_window_warned: bool = false ## Set once the over-window warning has posted for the current overflow, re-armed when a prediction lands back under the window, so a persisting overflow warns once instead of every send (see _maybe_warn_over_window). Rebuilt from the persisted notices on load, so a reload mid-overflow doesn't re-post a warning already on record (see _derive_over_window_warned).
 var _compaction_stalled: bool = false ## Set once a compaction event committed nothing and neither pass could act on the next send either: the stalled warning has posted and the trigger stops appending repeat no-op events. Re-armed when the prediction drops under the trigger line, when a manual pass commits, or the moment either pass would act again (see _maybe_trigger_compaction); rebuilt from the persisted notices on load (see _derive_compaction_stalled).
 var _downshift_notice: Control ## The live "this conversation no longer fits the current model" row, or null while it doesn't apply. Deliberately not a history entry: it states a CONDITION rather than recording an event, so it is re-evaluated and dropped the moment the condition clears (see _refresh_downshift_notice).
+var _no_sources_notice: Control ## The standing "no source enabled" guidance row, or null while at least one source is enabled. A condition like the downshift row — never persisted, re-derived on every sources edit, gone the moment a source is enabled (see _refresh_no_sources_notice).
+var _unknown_window_notice: Control ## The standing "context window unknown" guidance row, or null while the window is known, a probe is still in flight, or a debug threshold stands in. A condition like its siblings above (see _refresh_unknown_window_notice).
+var _window_probe_failed := "" ## Qualified id whose latest context-window probe answered with nothing — the "we asked and the source doesn't know" evidence the unknown-window row requires, so it never flashes while a probe is merely still in flight. Cleared by a model switch (the id no longer matches) or a window arriving.
 var _downshift_from: String = "" ## The model this session most recently switched away from, purely so the downshift row can name it; runtime-only, since after a reload there is no swap to attribute.
 
 var _mono_font: Font ## Editor source-code font
@@ -173,8 +187,12 @@ var _thinking_text: String = "" ## accumulated reasoning for the in-flight turn
 var _pending_thinking: String = "" ## reasoning received since the last per-frame flush; landing every chunk individually was an O(n²) relayout on long traces (see _flush_thinking)
 var _generating_header: Label = null ## "generating response..." placeholder shown once the model starts its answer; removed when the message itself is added
 
-var _stats_header: Label ## Sticky one-line header (outside the scroll): created date & time · message count · ~context tokens. Hidden until the session has a message.
-var _header_buttons: HBoxContainer ## Row under the stats line holding the expand controls; shown/hidden with the header.
+var _stats_row: HBoxContainer ## Top sticky row holding the stats label and the jump cluster; hidden until the session has a message.
+var _stats_header: Label ## Sticky stats label (outside the scroll): created date & time · message count · ~context tokens.
+var _header_buttons: HBoxContainer ## Row under the stats line holding the expand controls; always up, unlike the stats line, so view preferences can be set before the first message.
+var _condensed_check: Button ## The row's leftmost control, the eye toggle mirroring GDLLMSettings.CONDENSED_FEED: open shows the full feed, closed folds each tool call/result pair to a one-line summary (see _apply_condensed_mode).
+var _condensed_applied := false ## Condensed-feed state last dressed onto the log, so the settings-change re-sync only re-dresses (and re-collapses open pairs) on a real flip.
+var _pending_pairs: Array[Dictionary] = [] ## Call/result pair wrappers whose result panel hasn't landed yet, oldest first ({"key", "details", "toggle", "summary", "age", "has_subagent"?}); results follow their calls in order both live and on replay, so FIFO by key pairs them (see _close_tool_pair). A pending pair's summary wears the present-progressive form; `summary` is the past-tense wording the close settles it to, `age` feeds the fold timer (see _tick_fold_timer), and has_subagent stands the timer aside for the run's own parenthetical.
 var _auto_thinking_check: Button ## Header toggle mirroring GDLLMSettings.AUTO_EXPAND_THINKING; the same setting the settings dialog edits.
 var _auto_tools_check: Button ## Header toggle mirroring GDLLMSettings.AUTO_EXPAND_TOOL_CALLS.
 var _auto_results_check: Button ## Header toggle mirroring GDLLMSettings.AUTO_EXPAND_TOOL_RESULTS.
@@ -190,7 +208,7 @@ var _context_dialog_body: TextEdit ## The dialog's request-JSON view, repainted 
 var _context_save_button: Button ## The dialog's "Save to file..." action-row button, hidden when the body holds nothing to save (the unavailable notice).
 var _context_save_dialog: EditorFileDialog ## Lazy save picker for writing a reconstruction to disk, reused so it keeps the last directory across saves.
 var _context_save_name := "" ## Suggested filename for the next save, stamped by whichever inspection populated the dialog.
-var _header_separator: HSeparator ## Divider under the header; shown/hidden together with it.
+var _header_separator: HSeparator ## Divider under the header row, up whenever it is.
 var _message_list: VBoxContainer
 var _log_target: VBoxContainer ## Where new log rows are added — normally _message_list, but repointed at a redirect's red panel so its notice, reasoning, and reply all stack on one background (see _add_redirect_notice). Reset to _message_list once that turn concludes.
 var _scroll: ScrollContainer
@@ -211,7 +229,7 @@ var _delete_files_check: Button ## Gates destructive tools the same way; shown o
 var _context_label: Label ## The "~est+rep/max" context meter — a live chars-per-token estimate of what the next send would append, the last request's reported prompt tokens, and the model's maximum context window (see _update_context_label) — sharing the response notice's flexible slot in the attach row and yielding to it while the notice is lit. Deliberately a passive readout: manual compaction got its own button beside the jump arrows instead (_compact_button), so the meter is never a click target.
 var _context_probe_attempted := "" ## The qualified id the last context-window probe asked about, successful or not. reapply_source re-applies the model on every editor-settings write, so without this latch a failing probe would re-fire per write; a repeat attempt for the same id waits for a deliberate model change instead.
 var _response_notice: Label ## "Response generated!" caption beside the ↓ jump button: lit when a reply lands while the user is scrolled up — the log never moves under them — and cleared once the bottom comes into view (see _set_response_notice).
-var _jump_button: Button ## The attach row's ↓ toggle: pressed mirrors _stick_to_bottom (lit while the view follows the bottom), and pressing it while detached is the deliberate jump back to the latest (see _on_jump_button_toggled).
+var _jump_button: Button ## The stats row jump cluster's ↓ toggle: pressed mirrors _stick_to_bottom (lit while the view follows the bottom), and pressing it while detached is the deliberate jump back to the latest (see _on_jump_button_toggled).
 var _compact_button: Button ## The attach row's manual-compaction button, left of the jump arrows; disabled while a request is pending, and its press only opens the confirmation gate (see _on_compact_pressed).
 var _compact_confirm: ConfirmationDialog ## Manual compaction's confirmation gate, built lazily on first press; each press re-defaults its per-pass checkboxes and repaints their captions from the live settings (see _manual_pass_defs).
 var _compact_pass_rows: Dictionary = {} ## Pass id -> {"check": CheckBox, "desc": Label} in the confirmation gate, one row per _manual_pass_defs entry; the check states at confirm time are exactly what _run_manual_compaction runs.
@@ -258,6 +276,12 @@ func _resolve_mono_font() -> Font:
 func _build_ui() -> void:
 	# --- Sticky stats header ---
 	# Lives outside the scroll container, so it stays pinned to the top while the message log scrolls beneath it.
+	# The whole row hides until the session has a message (see _update_stats_header); the jump cluster rides its right edge.
+	_stats_row = HBoxContainer.new()
+	_stats_row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	_stats_row.visible = false
+	add_child(_stats_row)
+
 	_stats_header = Label.new()
 	_stats_header.modulate = Color(1, 1, 1, 0.55)
 	_stats_header.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -266,14 +290,42 @@ func _build_ui() -> void:
 	if _mono_font != null:
 		_stats_header.add_theme_font_override("font", _mono_font)
 	_stats_header.add_theme_font_size_override("font_size", HEADER_FONT_SIZE)
-	_stats_header.visible = false # revealed once the session has a message (see _update_stats_header)
-	add_child(_stats_header)
+	_stats_row.add_child(_stats_header)
 
-	# Expand controls, sharing the header's shown-with-first-message gating. The toggles mirror the editor settings (each writes the same key, so the settings dialog stays in sync); the arrow buttons fold or unfold every thinking/tool disclosure in the log at once.
+	# The jump cluster ends the stats row, reading previous → next → top → newest; their snaps detach the follow naturally via _on_scroll_value_changed, like any user scroll.
+	var jump_prev_button := Button.new()
+	_apply_editor_icon(jump_prev_button, "ArrowUp", "↑")
+	jump_prev_button.tooltip_text = "Jump to the previous message — yours or the agent's response. Press again to step further back."
+	jump_prev_button.pressed.connect(_on_jump_prev_message_pressed)
+	_stats_row.add_child(jump_prev_button)
+
+	var jump_next_button := Button.new()
+	_apply_editor_icon(jump_next_button, "ArrowDown", "↓")
+	jump_next_button.tooltip_text = "Jump to the next message — yours or the agent's response. Press again to step further forward."
+	jump_next_button.pressed.connect(_on_jump_next_message_pressed)
+	_stats_row.add_child(jump_next_button)
+
+	var jump_top_button := Button.new()
+	_apply_editor_icon(jump_top_button, "MoveUp", "⤒")
+	jump_top_button.tooltip_text = "Jump to the top of the session."
+	jump_top_button.pressed.connect(_on_jump_top_pressed)
+	_stats_row.add_child(jump_top_button)
+
+	_jump_button = Button.new()
+	_jump_button.toggle_mode = true
+	_jump_button.set_pressed_no_signal(_stick_to_bottom)
+	_apply_editor_icon(_jump_button, "MoveDown", "↓")
+	_jump_button.tooltip_text = "Jump to the newest message and follow new ones. Lit while the view is stuck to the bottom; scrolling up detaches it."
+	_jump_button.toggled.connect(_on_jump_button_toggled)
+	_stats_row.add_child(_jump_button)
+
+	# Expand controls, up from the session's first frame — unlike the stats line above, so view preferences (the eye, auto-expand, search) can be set before the first message. The toggles mirror the editor settings (each writes the same key, so the settings dialog stays in sync); the arrow buttons fold or unfold every thinking/tool disclosure in the log at once.
 	_header_buttons = HBoxContainer.new()
 	_header_buttons.size_flags_horizontal = Control.SIZE_EXPAND_FILL
-	_header_buttons.visible = false
 	add_child(_header_buttons)
+
+	# The eye leads the row: open (unpressed) is the full transparent feed, closed folds each tool call and its result to a one-line summary — one click away from the full pair, so nothing is ever hidden, only folded (goal 2).
+	_condensed_check = _make_header_toggle("GuiVisibilityVisible", "Feed", "Condense the feed: fold each tool call and its result into a one-line summary; click a summary to open the full call and result — the auto-expand toggles decide whether what it reveals starts open. Shares the \"Condensed Feed\" editor setting.", _on_condensed_toggled)
 
 	# "Info" rather than "NodeInfo": the attach row's node toggle took that glyph, and two toggles wearing one icon in the same dock read as the same control.
 	_auto_thinking_check = _make_header_toggle("Info", "Thinking", "Auto-expand thinking traces as they stream. Shares the \"Auto Expand Thinking\" editor setting.", _on_auto_thinking_toggled)
@@ -281,7 +333,7 @@ func _build_ui() -> void:
 	_auto_results_check = _make_header_toggle("MemberMethod", "Results", "Auto-expand tool results when they appear. Shares the \"Auto Expand Tool Results\" editor setting.", _on_auto_results_toggled)
 	_debug_context_check = _make_header_toggle("Debug", "Debug", "Debug: show a button on each model turn and background task run that reconstructs the full request context sent to the model for it.", _on_debug_context_toggled)
 
-	# Search box between the switches and the fold/unfold buttons; it expands to fill the middle, so it doubles as the spacer that keeps those buttons at the right edge.
+	# Search box between the switches and the fold buttons; it expands to fill the middle, so it doubles as the spacer that keeps the fold buttons at the right edge.
 	_search_field = LineEdit.new()
 	_search_field.placeholder_text = "Search..."
 	_search_field.tooltip_text = "Search the log: hide tool calls, results, and responses (and their thinking) that don't contain every term, and highlight the terms where they appear. Press Enter to search; clear the field to show everything again."
@@ -292,14 +344,14 @@ func _build_ui() -> void:
 	_header_buttons.add_child(_search_field)
 
 	_collapse_all_button = Button.new()
-	_collapse_all_button.text = "▸"
+	_apply_editor_icon(_collapse_all_button, "CodeFoldedRightArrow", "▸")
 	_collapse_all_button.tooltip_text = "Collapse all thinking and tool calls"
 	_collapse_all_button.focus_mode = Control.FOCUS_NONE
 	_collapse_all_button.pressed.connect(_on_collapse_all_pressed)
 	_header_buttons.add_child(_collapse_all_button)
 
 	_expand_all_button = Button.new()
-	_expand_all_button.text = "▾"
+	_apply_editor_icon(_expand_all_button, "CodeFoldDownArrow", "▾")
 	_expand_all_button.tooltip_text = "Expand all thinking and tool calls"
 	_expand_all_button.focus_mode = Control.FOCUS_NONE
 	_expand_all_button.pressed.connect(_on_expand_all_pressed)
@@ -309,7 +361,6 @@ func _build_ui() -> void:
 	_sync_expand_toggle_buttons()
 
 	_header_separator = HSeparator.new()
-	_header_separator.visible = false
 	add_child(_header_separator)
 
 	# --- Message log ---
@@ -454,7 +505,7 @@ func _build_ui() -> void:
 	_delete_files_check.toggled.connect(_on_delete_files_toggled)
 	attach_row.add_child(_delete_files_check)
 
-	# The notice's box wears the agent turns' green bubble, drawn via self_modulate so the cleared notice keeps its footprint as the row's spacer and the ↓ button never shifts.
+	# The notice's box wears the agent turns' green bubble, drawn via self_modulate so the cleared notice keeps its footprint as the row's spacer and the compact button never shifts.
 	var notice_box := PanelContainer.new()
 	notice_box.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	notice_box.add_theme_stylebox_override("panel", _bubble_stylebox(GDLLMColors.color(GDLLMColors.AGENT_BACKGROUND)))
@@ -476,39 +527,12 @@ func _build_ui() -> void:
 	_apply_caption_style(_context_label)
 	notice_box.add_child(_context_label)
 
-	# Manual compaction, left of the jump arrows and gated behind a confirmation dialog so a misclick in the slim row can't rewrite the model's context.
+	# Manual compaction ends the attach row, gated behind a confirmation dialog so a misclick in the slim row can't rewrite the model's context.
 	_compact_button = Button.new()
 	_apply_editor_icon(_compact_button, "History", "⚡")
 	_compact_button.tooltip_text = "Compact context: shrink what the model sees of this conversation. A confirmation opens first, where each pass — pruning old tool results, summarizing older history — can be checked on or off, and an optional token target names the size to compact toward. Typing a focus there instead summarizes the whole conversation around that focus and restarts the model's context from it. The full history always stays in the log and the stored session."
 	_compact_button.pressed.connect(_on_compact_pressed)
 	attach_row.add_child(_compact_button)
-
-	# Plain jump buttons beside the ↓ toggle, reading previous → next → top → newest; their snaps detach the follow naturally via _on_scroll_value_changed, like any user scroll.
-	var jump_prev_button := Button.new()
-	_apply_editor_icon(jump_prev_button, "ArrowUp", "↑")
-	jump_prev_button.tooltip_text = "Jump to the previous message — yours or the agent's response. Press again to step further back."
-	jump_prev_button.pressed.connect(_on_jump_prev_message_pressed)
-	attach_row.add_child(jump_prev_button)
-
-	var jump_next_button := Button.new()
-	_apply_editor_icon(jump_next_button, "ArrowDown", "↓")
-	jump_next_button.tooltip_text = "Jump to the next message — yours or the agent's response. Press again to step further forward."
-	jump_next_button.pressed.connect(_on_jump_next_message_pressed)
-	attach_row.add_child(jump_next_button)
-
-	var jump_top_button := Button.new()
-	_apply_editor_icon(jump_top_button, "MoveUp", "⤒")
-	jump_top_button.tooltip_text = "Jump to the top of the session."
-	jump_top_button.pressed.connect(_on_jump_top_pressed)
-	attach_row.add_child(jump_top_button)
-
-	_jump_button = Button.new()
-	_jump_button.toggle_mode = true
-	_jump_button.set_pressed_no_signal(_stick_to_bottom)
-	_apply_editor_icon(_jump_button, "MoveDown", "↓")
-	_jump_button.tooltip_text = "Jump to the newest message and follow new ones. Lit while the view is stuck to the bottom; scrolling up detaches it."
-	_jump_button.toggled.connect(_on_jump_button_toggled)
-	attach_row.add_child(_jump_button)
 
 
 func _ensure_client() -> void:
@@ -547,6 +571,8 @@ func _apply_qualified_model(qid: String, switched: bool = false) -> void:
 		# The overflow this may post has a new cause, so a latch set by the old one must not swallow the next send's warning.
 		_over_window_warned = false
 	_refresh_downshift_notice()
+	_refresh_no_sources_notice() # the dock re-applies the model on every settings change, so a Connections edit lands here
+	_refresh_unknown_window_notice() # and an Effort Configuration edit (declaring or clearing a window) lands here the same way
 
 
 ## This session's model identity as a qualified "source::model" id (used by the dock to sync the global default).
@@ -633,7 +659,7 @@ func _replay_history() -> void:
 				continue
 			# A subagent tool persisted its inner run; replay that activity panel before the result, matching the live order.
 			if msg.has("subagent_activity"):
-				_replay_subagent_activity(String(msg.get("subagent_label", "Subagent")), msg["subagent_activity"], bool(msg.get("subagent_failed", false)))
+				_replay_subagent_activity(String(msg.get("subagent_label", "Subagent")), msg["subagent_activity"], bool(msg.get("subagent_failed", false)), String(msg.get("tool_name", "tool")))
 			_add_tool_result_block(String(msg.get("tool_name", "tool")), String(msg.get("content", "")), false)
 			continue
 		# An attachment's synthetic call turn is not a send point and streamed nothing, so it gets its blue block alone — no inspection button, no thinking, no stats.
@@ -673,8 +699,10 @@ func _replay_history() -> void:
 	# A rebuild renders everything fresh and visible, so a search in effect (e.g. across clear_thinking's rebuild) must re-apply.
 	if not _active_search_terms.is_empty():
 		_apply_search_filter()
-	# The downshift row is a condition, not a record, so a rebuild re-derives it instead of replaying it — including on a session reopened on a model that no longer holds it.
+	# The downshift row is a condition, not a record, so a rebuild re-derives it instead of replaying it — including on a session reopened on a model that no longer holds it. The no-sources and unknown-window guidance rows are the same kind of thing.
 	_refresh_downshift_notice()
+	_refresh_no_sources_notice()
+	_refresh_unknown_window_notice()
 	_send_button.disabled = false
 	_follow_to_bottom()
 
@@ -957,11 +985,10 @@ func _update_stats_header() -> void:
 		return
 	# The context meter repaints with the header — every history change lands here — and must repaint even for an empty session, so it rides ahead of the early return.
 	_update_context_label()
-	# No header until the conversation has started.
+	# No stats row (stats + jump cluster) until the conversation has started; the button row and its separator stay up so view preferences (the eye, auto-expand, search) can be set before the first message.
 	var has_messages := not _history.is_empty()
-	_stats_header.visible = has_messages
-	_header_buttons.visible = has_messages
-	_header_separator.visible = has_messages
+	if is_instance_valid(_stats_row):
+		_stats_row.visible = has_messages
 	if not has_messages:
 		return
 	# A background task's record or a notice isn't a conversation message, so the count skips them.
@@ -1006,7 +1033,9 @@ func _on_context_window_received(model: String, tokens: int) -> void:
 	if model != String(GDLLMSources.resolve_qualified(_qualified_model).get("model", "")):
 		return
 	GDLLMContexts.store(_qualified_model, tokens)
+	_window_probe_failed = _qualified_model if tokens <= 0 else ""
 	_update_context_label()
+	_refresh_unknown_window_notice() # a successful probe clears the standing row; one answering with nothing raises it
 	if tokens > 0:
 		_refresh_downshift_notice()
 
@@ -1041,6 +1070,59 @@ static func _downshift_row_text(model: String, predicted: int, window: int, from
 	var swap := "" if from_model == "" else ", switched from %s" % from_model
 	var measured := "" if measured_on == "" else " That count was reported by %s, before the switch." % measured_on
 	return "⚠ This conversation no longer fits %s: ~%s tokens against its %s-token context window%s.%s The next request may be rejected, or silently drop the oldest messages including the system prompt. %s" % [model, _tokens_3sig(predicted), _tokens_k(window), swap, measured, _over_window_advice(false, true, true, needed)]
+
+
+## Show (or drop) the standing guidance row for the no-enabled-sources condition: with every source off, nothing can list models or answer a send, so the log says where to fix it instead of letting the first action fail cryptically (goal 3). Ephemeral by design — a condition, not a record — so it is never persisted, re-derived on every Connections edit, and gone the moment a source is enabled. Sits in the log even before the first message, which is exactly when a fresh install needs it.
+func _refresh_no_sources_notice() -> void:
+	var any_enabled := false
+	for source in GDLLMSources.get_sources():
+		if source is Dictionary and GDLLMSources.is_enabled(source):
+			any_enabled = true
+			break
+	if any_enabled or not is_instance_valid(_message_list):
+		if is_instance_valid(_no_sources_notice):
+			var parent := _no_sources_notice.get_parent()
+			if parent != null:
+				parent.remove_child(_no_sources_notice) # detach now so the freed row doesn't linger a frame
+			_no_sources_notice.queue_free()
+		_no_sources_notice = null
+		return
+	if is_instance_valid(_no_sources_notice):
+		return # already up; the condition is unchanged
+	var notice := Label.new()
+	notice.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	notice.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_apply_caption_style(notice, GDLLMColors.color(GDLLMColors.WARNING_CAPTION))
+	notice.text = "No source enabled in Connections. Use the ⚙ Connections button beside the model picker to enable and configure at least one provider."
+	_message_list.add_child(notice)
+	_no_sources_notice = notice
+	_follow_to_bottom()
+
+
+## Show (or drop) the standing guidance row for an unknown context window: without one, automatic compaction, the over-window warning, and the stall notice are all inert (see _maybe_trigger_compaction's early return), so the user must know their overflow guards are off — and where to fix that — before the first message is even sent (goal 3). Requires the model's own probe to have answered with nothing (see _window_probe_failed), so a probe merely still in flight never flashes it, and stands down while a debug threshold substitutes for the window, since the guards then run against it. Ephemeral like its sibling condition rows: never persisted, re-derived on model/settings changes, replay, and probe results.
+func _refresh_unknown_window_notice() -> void:
+	var applies := _qualified_model != "" \
+			and GDLLMContexts.window_for(_qualified_model) <= 0 \
+			and _window_probe_failed == _qualified_model \
+			and GDLLMSettings.get_compaction_debug_override() <= 0
+	if not applies or not is_instance_valid(_message_list):
+		if is_instance_valid(_unknown_window_notice):
+			var parent := _unknown_window_notice.get_parent()
+			if parent != null:
+				parent.remove_child(_unknown_window_notice) # detach now so the freed row doesn't linger a frame
+			_unknown_window_notice.queue_free()
+		_unknown_window_notice = null
+		return
+	if is_instance_valid(_unknown_window_notice):
+		return # already up; the condition is unchanged
+	var notice := Label.new()
+	notice.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	notice.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_apply_caption_style(notice, GDLLMColors.color(GDLLMColors.WARNING_CAPTION))
+	notice.text = "This model's context window is unknown (the source reports none). Automatic compaction and overflow warnings are inactive until one is set — use the ⚡ Effort Configuration button to specify the context window. You may need to manually identify the context window from the provider's website."
+	_message_list.add_child(notice)
+	_unknown_window_notice = notice
+	_follow_to_bottom()
 
 
 ## Drop the standing downshift row, if one is up. Safe against a log rebuild having freed it already.
@@ -1090,7 +1172,10 @@ func _update_context_label() -> void:
 	if debug_window > 0:
 		window_long = "!%s — a debug-enforced threshold standing in for the model's window of %s" % [_comma(debug_window), window_long]
 	var trigger_note := ""
-	if GDLLMSettings.is_auto_compaction_enabled():
+	if debug_window <= 0 and window <= 0:
+		# No window to judge against means every overflow guard is inert — the note must say so rather than describe a trigger that cannot fire.
+		trigger_note = " Automatic compaction and overflow warnings are inactive while the window is unknown — use the ⚡ Effort Configuration button to specify the context window."
+	elif GDLLMSettings.is_auto_compaction_enabled():
 		if debug_window > 0:
 			trigger_note = " Debug override active: automatic compaction triggers as soon as the prediction reaches the %s-token threshold — the buffer is enforced to 0 while the override is set (Editor Settings → Gdllm → Compaction)." % _comma(debug_window)
 		else:
@@ -1206,6 +1291,42 @@ func _on_auto_results_toggled(on: bool) -> void:
 	GDLLMSettings.set_auto_expand_tool_results(on)
 
 
+## The header's eye was flipped: persist the condensed-feed preference through the shared setter — the settings write re-syncs every session's header, ours included (see sync_expand_toggles_from_settings) — then dress this log now rather than waiting on that round-trip.
+func _on_condensed_toggled(on: bool) -> void:
+	GDLLMSettings.set_condensed_feed(on)
+	_refresh_condensed_button()
+
+
+## Point the eye at the stored state — open for the full feed, closed for the condensed one — and, only when that state actually changed, re-dress the log and header (a re-sync fires for every settings change, and re-dressing would needlessly re-collapse pairs the user had opened).
+func _refresh_condensed_button() -> void:
+	if not is_instance_valid(_condensed_check):
+		return
+	var condensed := GDLLMSettings.is_condensed_feed()
+	_apply_editor_icon(_condensed_check, "GuiVisibilityHidden" if condensed else "GuiVisibilityVisible", "Feed")
+	if condensed != _condensed_applied:
+		_condensed_applied = condensed
+		_apply_condensed_mode()
+
+
+## Bring the rendered log in line with the condensed-feed state: every pair shows either its one-line summary (condensed — re-collapsed, so the view resets clean) or its full call/result details. The auto-expand toggles all stay up in both modes — with the feed condensed, the call and result preferences govern what an opened fold reveals (see _apply_auto_expand_settings).
+func _apply_condensed_mode() -> void:
+	if is_instance_valid(_message_list):
+		_apply_condensed_recursive(_message_list, GDLLMSettings.is_condensed_feed())
+
+
+## Walk the log tree and put every fold in the given mode; recurses everywhere so folds rendered into a redirect panel follow too.
+func _apply_condensed_recursive(node: Node, condensed: bool) -> void:
+	for child in node.get_children():
+		if child is VBoxContainer and child.has_meta("feed_fold") and child.get_child_count() >= 2:
+			var toggle := child.get_child(0) as Button
+			var details := child.get_child(1) as Control
+			toggle.visible = condensed
+			toggle.set_pressed_no_signal(false)
+			_paint_disclosure(toggle, false)
+			details.visible = not condensed
+		_apply_condensed_recursive(child, condensed)
+
+
 ## The header's debug switch was flipped: reveal or hide every turn's context-inspection button. Session-local view state, so nothing is written to settings.
 func _on_debug_context_toggled(on: bool) -> void:
 	for btn in _turn_debug_buttons:
@@ -1221,7 +1342,7 @@ func _on_expand_all_pressed() -> void:
 	_set_all_disclosures(true)
 
 
-## Fold (or unfold) every thinking and tool-call disclosure in the log at once, including the in-flight one and each subagent's inner steps. Only toggles tagged "thinking"/"tool" are touched, so message, attachment, and subagent-note disclosures keep their state.
+## Fold (or unfold) every thinking and tool disclosure in the log at once, including the in-flight one, each subagent's inner steps, and the condensed folds. Only kind-tagged toggles ("thinking", "tool", "tool_result", "fold") are touched, so message, attachment, and subagent-note disclosures keep their state.
 func _set_all_disclosures(expanded: bool) -> void:
 	_set_disclosures_recursive(_message_list, expanded)
 
@@ -1330,6 +1451,9 @@ func _sync_expand_toggle_buttons() -> void:
 		_auto_tools_check.set_pressed_no_signal(GDLLMSettings.is_auto_expand_tool_calls())
 	if is_instance_valid(_auto_results_check):
 		_auto_results_check.set_pressed_no_signal(GDLLMSettings.is_auto_expand_tool_results())
+	if is_instance_valid(_condensed_check):
+		_condensed_check.set_pressed_no_signal(GDLLMSettings.is_condensed_feed())
+		_refresh_condensed_button()
 
 
 ## Public entry point for the dock to re-sync the header switches after a settings change (the switch and the settings dialog share one key, so a change on either must reflect on the other).
@@ -3007,9 +3131,10 @@ func _add_compaction_panel(entry: Dictionary, event_index: int, scroll: bool = t
 	_settle_compaction_panel(body, entry, event_index, scroll)
 
 
-## Open the panel and render its header — why the trigger fired (the incremental prediction, the buffer, the window), or that the user asked for it. Everything the header states is known before any pass runs, which is what lets the live path put this on screen first and append each pass's row beneath it as it lands.
+## Open the panel and render its header — why the trigger fired (the incremental prediction, the buffer, the window), or that the user asked for it. Everything the header states is known before any pass runs, which is what lets the live path put this on screen first and append each pass's row beneath it as it lands. The panel sits behind a condensed fold that opens progressive and settles with the outcome (see _settle_compaction_panel).
 func _open_compaction_panel(entry: Dictionary) -> VBoxContainer:
-	var body := _new_group_panel(GDLLMColors.color(GDLLMColors.COMPACTION_BACKGROUND))
+	var opening := "Compacting the conversation around a focus…" if String(entry.get("focus", "")) != "" else "Compacting context…"
+	var body := _new_group_panel(GDLLMColors.color(GDLLMColors.COMPACTION_BACKGROUND), _new_condensed_fold(opening, GDLLMColors.color(GDLLMColors.WARNING_CAPTION)))
 	var reported := int(entry.get("reported", 0))
 	var estimated := int(entry.get("estimated", 0))
 	var window := int(entry.get("window", 0))
@@ -3111,12 +3236,23 @@ func _settle_compaction_panel(body: VBoxContainer, entry: Dictionary, event_inde
 	else:
 		footer.text = "Still ~%s tokens over the threshold after every pass; the request was sent anyway." % _tokens_3sig(need - saved)
 	body.add_child(footer)
+	_settle_fold_summary(body, _compaction_fold_summary(entry))
 	var btn := _add_precompaction_debug_button(event_index)
 	var panel := body.get_parent()
 	if btn != null and is_instance_valid(panel) and btn.get_parent() == panel.get_parent():
 		panel.get_parent().move_child(btn, panel.get_index())
 	if scroll:
 		_follow_to_bottom()
+
+
+## The one-line settled wording of a compaction event for its condensed fold: what was reclaimed, or that nothing was.
+func _compaction_fold_summary(entry: Dictionary) -> String:
+	var steps: Array = entry.get("steps", []) if entry.get("steps") is Array else []
+	if steps.is_empty():
+		return "Compaction reclaimed nothing"
+	if String(entry.get("focus", "")) != "":
+		return "Compacted the conversation around a focus"
+	return "Compacted context (~%s tokens reclaimed)" % _tokens_3sig(_entry_saved(entry))
 
 
 ## Render whatever steps `entry` gained since the last flush into the live event panel, so each pass's result appears the moment it lands rather than after the whole run. No-op outside a live event.
@@ -3416,18 +3552,30 @@ func _process(delta: float) -> void:
 			h.phase_cycler.tick(delta)
 		if is_instance_valid(h.status):
 			h.status.text = _subagent_status_text(h)
+		# With the feed condensed the run's panel is folded away, so its pair's summary carries the liveness instead: "Reading player.gd… (Subagent summarizing for 72s…)".
+		if GDLLMSettings.is_condensed_feed() and not h.pair.is_empty() and not bool(h.pair.get("settled", false)):
+			var pair_toggle: Button = h.pair["toggle"]
+			if is_instance_valid(pair_toggle):
+				_paint_disclosure(pair_toggle, pair_toggle.button_pressed, " (%s)" % _subagent_parenthetical(h))
 	# The live immediate-tool caption ticks the same way, also while _pending is false.
 	if _live_tool_caption != null and is_instance_valid(_live_tool_caption):
 		_live_tool_elapsed += delta
 		_live_tool_caption.text = _live_tool_caption_text()
+	# A condensed fold line still waiting on its result gains a ticking "(Ns)" once it has sat past the threshold — a quick call settles first and never shows one. Subagent pairs stand aside: their parenthetical above carries richer liveness.
+	for pending in _pending_pairs:
+		pending["age"] = float(pending["age"]) + delta
+		if not bool(pending.get("has_subagent", false)) and is_instance_valid(pending["toggle"]):
+			_tick_fold_timer(pending["toggle"], float(pending["age"]))
 	# So does the dock's title run — it starts after the turn concludes, when nothing else is pending.
 	if _title_task_active and is_instance_valid(_title_task_caption):
 		_title_task_elapsed += delta
 		_title_task_caption.text = _title_task_caption_text()
+		_tick_fold_timer(_title_task_caption, _title_task_elapsed)
 	# And a compaction pass's summarization run, which holds the pending send while it streams.
 	if _compaction_summarizer != null and is_instance_valid(_compaction_caption):
 		_compaction_elapsed += delta
 		_compaction_caption.text = _compaction_caption_text()
+		_tick_fold_timer(_compaction_caption, _compaction_elapsed)
 	if not _pending:
 		return
 	_think_elapsed += delta
@@ -3445,8 +3593,7 @@ func _process(delta: float) -> void:
 func _paint_thinking_caption(caption: String) -> void:
 	if not is_instance_valid(_active_thinking_toggle):
 		return
-	var arrow := "▾ " if _active_thinking_toggle.button_pressed else "▸ "
-	_active_thinking_toggle.text = arrow + caption
+	_paint_disclosure_text(_active_thinking_toggle, _active_thinking_toggle.button_pressed, caption)
 
 
 ## The live reasoning caption for this frame: the wiping verb plus how long the model has been reasoning.
@@ -3536,7 +3683,10 @@ func _clear_message_log() -> void:
 	_model_change_rows.clear() # these rows live in _message_list too; forget them before the loop frees the nodes so we never touch freed ones
 	_ephemeral_notices.clear() # same: the loop below frees the notices with the rest of the log
 	_turn_debug_buttons.clear() # same: the per-turn debug buttons are about to be freed, and a rebuild recreates them with fresh history indexes
+	_pending_pairs.clear() # same: any pair still waiting on a result is freed with the log, and a replay re-opens pairs in order
 	_downshift_notice = null # the standing downshift row lives in _message_list too; a rebuild frees it and _refresh_downshift_notice re-derives it if it still applies
+	_no_sources_notice = null # same for the no-sources guidance row
+	_unknown_window_notice = null # and the unknown-window one
 	# Same again for a compaction event's live panels: a rebuild replays them from their records, so the handles into the freed nodes must go.
 	_compaction_panel_body = null
 	_compaction_run_body = null
@@ -3551,6 +3701,29 @@ func _apply_caption_style(control: Control, color: Color = GDLLMColors.color(GDL
 	control.modulate = color
 	if _mono_font != null:
 		control.add_theme_font_override("font", _mono_font)
+
+
+## Strip the editor theme's accent-colored pressed tint from a disclosure toggle's icon: an expanded disclosure is a pressed toggle, but it isn't "active" — the glyph should read the same in both states.
+func _neutralize_pressed_icon(toggle: Button) -> void:
+	toggle.add_theme_color_override("icon_pressed_color", Color(1, 1, 1))
+	toggle.add_theme_color_override("icon_hover_pressed_color", Color(1, 1, 1))
+
+
+## Point a disclosure toggle at `expanded`, wearing the editor's code-fold glyphs — CodeFoldedRightArrow collapsed, CodeFoldDownArrow expanded, siblings drawn in the same neutral white (GuiOptionArrow's gray converts to the theme's accent tint) — with `text` as its caption; a theme lacking the glyphs falls back to the ▸/▾ prefixes.
+func _paint_disclosure_text(toggle: Button, expanded: bool, text: String) -> void:
+	var editor_theme := EditorInterface.get_editor_theme()
+	var icon_name := "CodeFoldDownArrow" if expanded else "CodeFoldedRightArrow"
+	if editor_theme != null and editor_theme.has_icon(icon_name, "EditorIcons"):
+		toggle.icon = editor_theme.get_icon(icon_name, "EditorIcons")
+		toggle.text = text
+	else:
+		toggle.icon = null
+		toggle.text = ("▾ " if expanded else "▸ ") + text
+
+
+## The meta-label form most repaints use: the toggle's stored label as the caption, plus an optional suffix (a ticking timer, a subagent's parenthetical).
+func _paint_disclosure(toggle: Button, expanded: bool, suffix: String = "") -> void:
+	_paint_disclosure_text(toggle, expanded, String(toggle.get_meta("label")) + suffix)
 
 
 ## Wrap `body` in a collapsible panel (see _make_collapsible for the parameters), add it to the current log target, and return the toggle. Shared by every log entry so they all read as the same family.
@@ -3573,18 +3746,20 @@ func _make_collapsible(body: Control, expanded: bool, label: String, caption_col
 	toggle.flat = true
 	toggle.focus_mode = Control.FOCUS_NONE
 	toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	toggle.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART # a long caption (an attachment's label, a wordy summary) wraps instead of widening the dock's minimum width
 	_apply_caption_style(toggle, caption_color)
+	_neutralize_pressed_icon(toggle)
 	toggle.set_meta("label", label)
 	# Tag thinking/tool disclosures so the header's collapse/expand-all can fold just those, leaving message and attachment disclosures untouched. The same panels are what the header search shows or hides (see _filter_search_units).
 	if kind != "":
 		toggle.set_meta("kind", kind)
 		panel.set_meta("search_unit", true)
-	toggle.text = ("▾ " if expanded else "▸ ") + label
+	_paint_disclosure(toggle, expanded)
 
 	body.visible = expanded
 	toggle.toggled.connect(func(on: bool) -> void:
 		body.visible = on
-		toggle.text = ("▾ " if on else "▸ ") + String(toggle.get_meta("label")))
+		_paint_disclosure(toggle, on))
 
 	panel.add_child(toggle)
 	panel.add_child(body)
@@ -3693,7 +3868,7 @@ func _add_message(role: String, text: String, stats: Dictionary = {}, scroll: bo
 			bubble.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 			bubble.add_theme_stylebox_override("panel", _bubble_stylebox(GDLLMColors.color(GDLLMColors.USER_BACKGROUND)))
 			bubble.add_child(turn)
-			bubble.set_meta("jump_anchor", true) # the attach row's ↑/↓ arrows walk these bubbles (see _on_jump_prev_message_pressed)
+			bubble.set_meta("jump_anchor", true) # the header's ↑/↓ arrows walk these bubbles (see _on_jump_prev_message_pressed)
 			_log_target.add_child(bubble)
 		"assistant":
 			# The agent's final response sits in a green-tinted bubble carrying its "Generated response for Ns…" disclosure — mirroring the user's blue turn. The reasoning trace above it stays outside, plain.
@@ -3702,7 +3877,7 @@ func _add_message(role: String, text: String, stats: Dictionary = {}, scroll: bo
 			bubble.add_theme_stylebox_override("panel", _bubble_stylebox(GDLLMColors.color(GDLLMColors.AGENT_BACKGROUND)))
 			bubble.add_child(_make_collapsible(content, true, _generated_label(seconds), GDLLMColors.color(GDLLMColors.AGENT_CAPTION)))
 			bubble.set_meta("search_unit", true) # responses filter as whole bubbles; the user's blue turns stay put as the conversation's anchors
-			bubble.set_meta("jump_anchor", true) # a response is a stop on the attach row's ↑/↓ walk, like the user turn that prompted it
+			bubble.set_meta("jump_anchor", true) # a response is a stop on the header's ↑/↓ walk, like the user turn that prompted it
 			_log_target.add_child(bubble)
 		"redirect":
 			# A reply the system forced after a redirect (see _request_loop_summary). Live, it stacks flat inside the shared red panel the notice opened (_log_target is that panel), which already supplies the background. Standalone — replayed on reload, where the notice is gone — it gets its own red bubble so the redirect stays visibly red.
@@ -4406,24 +4581,27 @@ static func _is_attachment(msg: Dictionary) -> bool:
 	return bool(msg.get("attachment", false))
 
 
-## The blue "📎 You attached <label>" disclosure standing in for an attachment's tool call, showing the arguments a re-run would use.
+## The blue "📎 You attached <label>" disclosure standing in for an attachment's tool call, showing the arguments a re-run would use. Opens a pair like a real call so the condensed feed folds it to "📎 Attached <label>".
 func _add_attachment_call_block(label: String, args: Dictionary, scroll: bool = true) -> void:
-	_build_collapsible(_mono_body(JSON.stringify(args, "\t")), GDLLMSettings.is_auto_expand_tool_calls(), "📎 You attached %s" % label, GDLLMColors.color(GDLLMColors.ATTACHMENT_CAPTION), "tool")
+	var panel := _make_collapsible(_mono_body(JSON.stringify(args, "\t")), GDLLMSettings.is_auto_expand_tool_calls(), "📎 You attached %s" % label, GDLLMColors.color(GDLLMColors.ATTACHMENT_CAPTION), "tool")
+	_open_tool_pair("attachment::" + label, "📎 Attached %s" % label, panel, GDLLMColors.color(GDLLMColors.ATTACHMENT_CAPTION))
 	if scroll:
 		_follow_to_bottom()
 
 
 ## The blue "→ Attached content" disclosure holding what was attached — the full text always, even once the model's copy has been pruned away (goal 2).
 func _add_attachment_result_block(label: String, content: String, scroll: bool = true) -> void:
-	_build_collapsible(_mono_body(content), GDLLMSettings.is_auto_expand_tool_results(), "→ Attached content: %s" % label, GDLLMColors.color(GDLLMColors.ATTACHMENT_CAPTION), "tool")
+	var panel := _make_collapsible(_mono_body(content), GDLLMSettings.is_auto_expand_tool_results(), "→ Attached content: %s" % label, GDLLMColors.color(GDLLMColors.ATTACHMENT_CAPTION), "tool_result")
+	_close_tool_pair("attachment::" + label, panel)
 	if scroll:
 		_follow_to_bottom()
 
 
-## Add a collapsed "⚙ Called <name>" disclosure showing the call's arguments — one per tool call, matching a message in history so it replays the same live and on reload.
+## Add a collapsed "⚙ Called <name>" disclosure showing the call's arguments — one per tool call, matching a message in history so it replays the same live and on reload. The disclosure opens a pair the tool's result later joins, which is what the condensed feed folds to one line.
 func _add_tool_call_block(tool_name: String, args: Dictionary, scroll: bool = true) -> void:
 	var body := _mono_body(JSON.stringify(args, "\t") if not args.is_empty() else "(no arguments)")
-	_build_collapsible(body, GDLLMSettings.is_auto_expand_tool_calls(), "⚙ Called %s" % tool_name, GDLLMColors.color(GDLLMColors.TOOL_CAPTION), "tool")
+	var panel := _make_collapsible(body, GDLLMSettings.is_auto_expand_tool_calls(), "⚙ Called %s" % tool_name, GDLLMColors.color(GDLLMColors.TOOL_CAPTION), "tool")
+	_open_tool_pair(tool_name, _pretty_tool_summary(tool_name, args), panel, GDLLMColors.color(GDLLMColors.TOOL_CAPTION))
 	if scroll:
 		_follow_to_bottom()
 
@@ -4431,14 +4609,233 @@ func _add_tool_call_block(tool_name: String, args: Dictionary, scroll: bool = tr
 ## Add a "→ Result from <name>" disclosure showing what the tool returned — one per tool message. Starts open or collapsed per the auto-expand-tool-results setting.
 func _add_tool_result_block(tool_name: String, content: String, scroll: bool = true) -> void:
 	var body := _mono_body(content)
-	_build_collapsible(body, GDLLMSettings.is_auto_expand_tool_results(), "→ Result from %s" % tool_name, GDLLMColors.color(GDLLMColors.TOOL_CAPTION), "tool")
+	var panel := _make_collapsible(body, GDLLMSettings.is_auto_expand_tool_results(), "→ Result from %s" % tool_name, GDLLMColors.color(GDLLMColors.TOOL_CAPTION), "tool_result")
+	_close_tool_pair(tool_name, panel)
 	if scroll:
 		_follow_to_bottom()
+
+
+## Build the condensed feed's fold scaffolding in the log: a one-line summary toggle over a details box the caller fills, returned for that filling. In the full feed the summary stays hidden and the details always show, so the fold is invisible scaffolding; condensed, the summary is the row and the details open on click. Each fold is its own search unit — its subtree, summary text included, decides its visibility under a filter — while the panels inside keep filtering individually for the full feed, and its toggle joins the header's collapse/expand-all.
+func _new_condensed_fold(summary: String, caption_color: Color) -> VBoxContainer:
+	var fold := VBoxContainer.new()
+	fold.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	fold.add_theme_constant_override("separation", 2)
+	fold.set_meta("feed_fold", true)
+	fold.set_meta("search_unit", true)
+	var details := VBoxContainer.new()
+	details.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	details.add_theme_constant_override("separation", 2)
+	var toggle := Button.new()
+	toggle.toggle_mode = true
+	toggle.flat = true
+	toggle.focus_mode = Control.FOCUS_NONE
+	toggle.alignment = HORIZONTAL_ALIGNMENT_LEFT
+	toggle.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART # a long summary (a subagent task, a deep path) wraps instead of widening the dock's minimum width
+	_apply_caption_style(toggle, caption_color)
+	_neutralize_pressed_icon(toggle)
+	toggle.set_meta("label", summary)
+	toggle.set_meta("kind", "fold") # the header's collapse/expand-all folds these along with the disclosures inside them
+	_paint_disclosure(toggle, false)
+	var condensed := GDLLMSettings.is_condensed_feed()
+	toggle.visible = condensed
+	details.visible = not condensed
+	toggle.toggled.connect(func(on: bool) -> void:
+		if not GDLLMSettings.is_condensed_feed():
+			return # the full feed shows details regardless; a collapse-all sweep may still drive this toggle
+		details.visible = on
+		_paint_disclosure(toggle, on)
+		# Opening a fold re-applies the auto-expand preferences to what it reveals, so the pair reads exactly as a freshly rendered full-feed one would. (An expand-all sweep drives this too, then overrides by walking the same toggles itself.)
+		if on:
+			_apply_auto_expand_settings(details))
+	fold.add_child(toggle)
+	fold.add_child(details)
+	_log_target.add_child(fold)
+	return details
+
+
+## Drive the call and result disclosures under `node` to the auto-expand settings — applied to a fold's details as it opens. Calls (kind "tool") follow auto-expand-tool-calls, results ("tool_result") auto-expand-tool-results; thinking disclosures keep their state, since the thinking toggle governs streaming, not revisiting.
+func _apply_auto_expand_settings(node: Node) -> void:
+	for child in node.get_children():
+		if child is Button and child.toggle_mode and child.has_meta("kind"):
+			match String(child.get_meta("kind")):
+				"tool":
+					child.button_pressed = GDLLMSettings.is_auto_expand_tool_calls()
+				"tool_result":
+					child.button_pressed = GDLLMSettings.is_auto_expand_tool_results()
+		_apply_auto_expand_settings(child)
+
+
+## Open a call/result pair around `call_panel`: a fold whose details the matching result panel later joins (see _close_tool_pair) — as does a deferred call's whole subagent panel (see _open_subagent_panel), so the pair holds call, inner run, and result in their live order. The fold opens wearing the summary's present-progressive form ("Reading player.gd…"), which the close settles to the past tense — so a watched feed reads as work in motion, and an instant call settles before the progressive form is ever drawn.
+func _open_tool_pair(pair_key: String, summary: String, call_panel: Control, caption_color: Color) -> void:
+	var details := _new_condensed_fold(_pretty_progressive(summary), caption_color)
+	details.add_child(call_panel)
+	var toggle := details.get_parent().get_child(0) as Button
+	_pending_pairs.append({"key": pair_key, "details": details, "toggle": toggle, "summary": summary, "age": 0.0})
+
+
+## The summary toggle of the condensed fold enclosing `node`, or null when the node sits outside any fold. Handed the toggle itself, it returns it — the pending-pair timer leans on that.
+func _fold_toggle_for(node: Node) -> Button:
+	var walker := node
+	while walker != null and not (walker is VBoxContainer and walker.has_meta("feed_fold")):
+		walker = walker.get_parent()
+	if walker == null or walker.get_child_count() < 1:
+		return null
+	return walker.get_child(0) as Button
+
+
+## Settle the summary of the condensed fold enclosing `node` to `summary` — the fold-content counterpart of _close_tool_pair's settling, for blocks (the title run) that live inside a fold without being pairs. A node outside any fold is left alone.
+func _settle_fold_summary(node: Node, summary: String) -> void:
+	var toggle := _fold_toggle_for(node)
+	if toggle == null:
+		return
+	toggle.set_meta("label", summary)
+	_paint_disclosure(toggle, toggle.button_pressed)
+
+
+## Paint the ticking "(Ns)" timer onto the fold summary enclosing `node` once `elapsed` has passed FOLD_TIMER_SECONDS — the liveness a folded panel can't show for itself. No-op before the threshold, with the feed not condensed, or outside any fold.
+func _tick_fold_timer(node: Node, elapsed: float) -> void:
+	if elapsed < FOLD_TIMER_SECONDS or not GDLLMSettings.is_condensed_feed():
+		return
+	var toggle := _fold_toggle_for(node)
+	if toggle == null or not is_instance_valid(toggle):
+		return
+	_paint_disclosure(toggle, toggle.button_pressed, " (%ds)" % int(elapsed))
+
+
+## The details box of the oldest pair still waiting under `pair_key`, or null — the peek counterpart to _close_tool_pair, for content that belongs inside a pair without closing it (a replayed subagent panel, which precedes its result).
+func _pair_details_for(pair_key: String) -> VBoxContainer:
+	for pending in _pending_pairs:
+		if String(pending["key"]) == pair_key and is_instance_valid(pending["details"]):
+			return pending["details"]
+	return null
+
+
+## The details box of the most recently opened pair still waiting on its result, or null. The live tool loop opens a call's pair immediately before launching its subagent, so the launching call's pair is always the newest pending one.
+func _last_pending_pair_details() -> VBoxContainer:
+	if _pending_pairs.is_empty():
+		return null
+	var pending: Dictionary = _pending_pairs.back()
+	return pending["details"] if is_instance_valid(pending["details"]) else null
+
+
+## Land `result_panel` in the oldest pair still waiting under `pair_key` — results follow their calls in order, live and on replay alike (an interrupted round still commits a result stub per call, see _commit_interrupted_tool_turn), so first-in-first-out per key pairs them even when a round mixes tools. No waiting pair (a defensive miss) drops the panel straight into the log, exactly the pre-pair rendering.
+func _close_tool_pair(pair_key: String, result_panel: Control) -> void:
+	for i in _pending_pairs.size():
+		var pending: Dictionary = _pending_pairs[i]
+		if String(pending["key"]) == pair_key and is_instance_valid(pending["details"]):
+			_pending_pairs.remove_at(i)
+			pending["settled"] = true # a subagent handle may still hold this entry (see RunningSubagent.pair); the flag stops its liveness repaints
+			# The summary settles from its progressive form to the past-tense wording now the result is in; the meta follows so every later repaint (a mode flip, the toggle's own relabel) uses the settled text.
+			var toggle: Button = pending["toggle"]
+			if is_instance_valid(toggle):
+				toggle.set_meta("label", String(pending["summary"]))
+				_paint_disclosure(toggle, toggle.button_pressed)
+			(pending["details"] as VBoxContainer).add_child(result_panel)
+			return
+	_log_target.add_child(result_panel)
+
+
+## One-line plain-language summary of a tool call for the condensed feed ("Read player.gd:0-32"), derived from the arguments alone so it reads the same before and after the result lands. Hand-written forms cover the everyday tools; anything else falls back to the humanized tool name plus the call's most identifying argument.
+func _pretty_tool_summary(tool_name: String, args: Dictionary) -> String:
+	var path := _pretty_path(String(args.get("path", "")))
+	match tool_name:
+		GDLLMTools.READ_FILE:
+			var span := ""
+			if args.has("start_line") or args.has("end_line"):
+				span = ":%d-%s" % [int(args.get("start_line", 0)), (str(int(args["end_line"])) if args.has("end_line") else "end")]
+			return "Read %s%s%s" % [path, span, " (full)" if bool(args.get("full", false)) else ""]
+		"read_function":
+			return "Read %s() in %s" % [String(args.get("name", "?")), path]
+		"check_script":
+			return "Checked %s" % path
+		"search_files":
+			return "Searched files for \"%s\"%s" % [String(args.get("query", "")), (" in %s" % path) if path != "" else ""]
+		"search_docs":
+			return "Searched docs for \"%s\"" % String(args.get("query", ""))
+		GDLLMTools.TOOL_SEARCH:
+			return "Searched tools for \"%s\"" % String(args.get("query", ""))
+		"list_directory":
+			return "Listed %s" % (path if path != "" else "res://")
+		"list_dependencies":
+			return "Listed %s of %s" % ["dependents" if bool(args.get("reverse", false)) else "dependencies", path]
+		"describe_class":
+			return "Described %s" % String(args.get("class", "?"))
+		"describe_member":
+			return "Described %s.%s" % [String(args.get("class", "?")), String(args.get("member", "?"))]
+		"describe_docs":
+			var member := String(args.get("member", ""))
+			return "Read docs for %s%s" % [String(args.get("class", "?")), ("." + member) if member != "" else ""]
+		GDLLMTools.DESCRIBE_SCENE:
+			var node_path := String(args.get("node_path", ""))
+			return "Described the open scene%s" % [(" at %s" % node_path) if node_path != "" else ""]
+		"describe_scene_file":
+			return "Described %s" % path
+		"read_editor_selection":
+			return "Read your editor selection"
+		"open_for_user":
+			return "Opened %s for you" % path
+		"edit_file":
+			return "Edited %s" % path
+		"edit_resource":
+			return "Edited %s" % path
+		"write_file":
+			return "Wrote %s" % path
+		"create_resource":
+			return "Created %s" % path
+		"move_file":
+			return "Moved %s to %s" % [path, _pretty_path(String(args.get("to", "?")))]
+		"rename_file":
+			return "Renamed %s to %s" % [path, String(args.get("new_name", "?"))]
+		"copy_file":
+			return "Copied %s to %s" % [path, _pretty_path(String(args.get("to", "?")))]
+		"delete_file":
+			return "Deleted %s" % path
+		"run_subagent":
+			return "Ran a subagent: %s" % _pretty_snippet(String(args.get("task", "")))
+		"use_skill":
+			return "Used skill %s" % String(args.get("name", "?"))
+		"run_script":
+			return "Ran %s" % path
+		"run_game":
+			var scene := _pretty_path(String(args.get("scene", "")))
+			return "Ran the game%s" % [(" (%s)" % scene) if scene != "" else ""]
+		"stop_game":
+			return "Stopped the game"
+	# Fallback: "profile_game" becomes "Profile game", trailed by whichever argument most identifies the call.
+	var subject := path
+	for key in ["query", "class", "scene", "setting", "name", "method", "animation"]:
+		if subject != "":
+			break
+		subject = str(args.get(key, ""))
+	var label := tool_name.replace("_", " ")
+	label = label.substr(0, 1).to_upper() + label.substr(1)
+	return label if subject == "" else "%s %s" % [label, subject]
+
+
+## The present-progressive form of a condensed summary ("Read player.gd" → "Reading player.gd…"), shown while the call's result is still pending; a summary opening with an unmapped word keeps its wording and just gains the ellipsis.
+func _pretty_progressive(summary: String) -> String:
+	var first := summary.get_slice(" ", 0)
+	if PROGRESSIVE_VERBS.has(first):
+		return String(PROGRESSIVE_VERBS[first]) + summary.substr(first.length()) + "…"
+	return summary + "…"
+
+
+## A path as the condensed feed shows it: res:// shorn (every project path carries it, so it's noise at a glance), anything else verbatim.
+func _pretty_path(path: String) -> String:
+	return path.trim_prefix("res://")
+
+
+## First line of `text`, clipped to fit a one-line summary.
+func _pretty_snippet(text: String) -> String:
+	var line := text.strip_edges().get_slice("\n", 0).strip_edges()
+	return line.left(57) + "…" if line.length() > 58 else line
 
 
 ## Show the ticking "⚙ <tool> — <verb> (00s)" caption under a tool-call block while its frame-yielding execute runs, so the editor staying responsive never hides that work is in flight (goal 2). An instant tool's caption is freed the same frame it was added, before it is ever drawn, so quick calls cost nothing visually.
 func _show_live_tool_caption(tool_name: String) -> void:
 	_clear_live_tool_caption()
+	if GDLLMSettings.is_condensed_feed():
+		return # the pending pair's own summary turns progressive instead (see _process); a separate row would double the announcement
 	_live_tool_name = tool_name
 	_live_tool_elapsed = 0.0
 	_live_tool_caption = Label.new()
@@ -4473,6 +4870,9 @@ func _launch_subagent(spec: Dictionary) -> RunningSubagent:
 	h.tasks_model = bool(spec.get("tasks_model", false))
 	h.map_key = String(spec.get("map_key", ""))
 	var first := _running_subagents.is_empty() # the batch's first subagent locks the input and starts the caption animation for the whole batch
+	if not _pending_pairs.is_empty():
+		h.pair = _pending_pairs.back() # the tool loop opened the launching call's pair moments ago, so the newest pending one is this run's
+		h.pair["has_subagent"] = true # the run's own parenthetical carries the liveness, so the plain fold timer stands aside
 	_running_subagents.append(h)
 	h.sub.activity.connect(_on_subagent_activity.bind(h))
 	_open_subagent_panel(h) # shows a "queued" caption until _start_subagent flips it to the running spinner
@@ -4549,9 +4949,9 @@ func _drive_subagent(h: RunningSubagent) -> void:
 		subagents_all_done.emit()
 
 
-## Open a subagent's faint purple activity panel with its animated "⠹ <label> (Ns)" caption; the panel then fills with the subagent's inner steps live (see _on_subagent_activity). Several such panels stack when a turn fans out multiple subagents, each animating on its own clock.
+## Open a subagent's faint purple activity panel with its animated "⠹ <label> (Ns)" caption; the panel then fills with the subagent's inner steps live (see _on_subagent_activity). Several such panels stack when a turn fans out multiple subagents, each animating on its own clock. The panel lives inside the launching call's pair, between the call and the result it will produce, so the condensed feed folds the whole run behind the pair's summary.
 func _open_subagent_panel(h: RunningSubagent) -> void:
-	h.panel_body = _new_subagent_panel()
+	h.panel_body = _new_subagent_panel(_last_pending_pair_details())
 	h.caption = Label.new()
 	h.caption.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	h.caption.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -4625,6 +5025,13 @@ func _subagent_caption_text(h: RunningSubagent) -> String:
 	return "%s %s (%02ds)" % [spinner, h.label, int(h.elapsed)]
 
 
+## The condensed summary's liveness parenthetical for a running subagent: the label's leading verb when it has one ("Summarizing x (n lines)" → "summarizing"), else "working", plus the run's elapsed seconds.
+func _subagent_parenthetical(h: RunningSubagent) -> String:
+	var first := h.label.get_slice(" ", 0)
+	var verb := first.to_lower() if first.ends_with("ing") else "working"
+	return "Subagent %s for %ds…" % [verb, int(h.elapsed)]
+
+
 ## A subagent's caption once its run ends: the label and total elapsed time, spinner dropped, a failed run marked with the same ✕ the title task's failure row uses so it can't be skimmed as a completed one.
 func _subagent_done_caption(h: RunningSubagent) -> String:
 	if h.failed:
@@ -4683,13 +5090,13 @@ func _subagent_status_text(h: RunningSubagent) -> String:
 			return "%s %s (%02ds)" % [spinner, h.label, int(h.phase_elapsed)]
 
 
-## Create the faint purple panel that groups a subagent's caption and inner activity (see _new_group_panel). Shared by the live run and history replay.
-func _new_subagent_panel() -> VBoxContainer:
-	return _new_group_panel(GDLLMColors.color(GDLLMColors.SUBAGENT_BACKGROUND))
+## Create the faint purple panel that groups a subagent's caption and inner activity (see _new_group_panel). Shared by the live run and history replay; both pass the launching call's pair details as `parent` so the whole run folds behind the pair's condensed summary.
+func _new_subagent_panel(parent: Control = null) -> VBoxContainer:
+	return _new_group_panel(GDLLMColors.color(GDLLMColors.SUBAGENT_BACKGROUND), parent)
 
 
-## Create a `tint`-washed panel that groups one system activity's rows into a single log block, add it to the log, and return its inner container for rows to be added to. The wash names the family — purple for subagents, gray for background tasks, orange for compaction disclosures.
-func _new_group_panel(tint: Color) -> VBoxContainer:
+## Create a `tint`-washed panel that groups one system activity's rows into a single log block, add it to `parent` (the log when null), and return its inner container for rows to be added to. The wash names the family — purple for subagents, gray for background tasks, orange for compaction disclosures.
+func _new_group_panel(tint: Color, parent: Control = null) -> VBoxContainer:
 	var panel := PanelContainer.new()
 	panel.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	panel.add_theme_stylebox_override("panel", _bubble_stylebox(tint))
@@ -4698,7 +5105,7 @@ func _new_group_panel(tint: Color) -> VBoxContainer:
 	body.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	body.add_theme_constant_override("separation", 2)
 	panel.add_child(body)
-	_log_target.add_child(panel)
+	(parent if parent != null else _log_target).add_child(panel)
 	return body
 
 
@@ -4747,7 +5154,7 @@ func _subagent_event_node(event: Dictionary) -> Control:
 			var body := _mono_body(JSON.stringify(call_args, "\t") if not call_args.is_empty() else "(no arguments)")
 			return _make_collapsible(body, GDLLMSettings.is_auto_expand_tool_calls(), "⚙ Called %s" % String(event.get("name", "tool")), GDLLMColors.color(GDLLMColors.TOOL_CAPTION), "tool")
 		"tool_result":
-			return _make_collapsible(_mono_body(String(event.get("content", ""))), GDLLMSettings.is_auto_expand_tool_results(), "→ Result from %s" % String(event.get("name", "tool")), GDLLMColors.color(GDLLMColors.TOOL_CAPTION), "tool")
+			return _make_collapsible(_mono_body(String(event.get("content", ""))), GDLLMSettings.is_auto_expand_tool_results(), "→ Result from %s" % String(event.get("name", "tool")), GDLLMColors.color(GDLLMColors.TOOL_CAPTION), "tool_result")
 		"thinking":
 			var thought := _mono_body(String(event.get("text", "")))
 			thought.modulate = GDLLMColors.color(GDLLMColors.THINKING_TEXT)
@@ -4786,9 +5193,9 @@ func _indent_wrap(node: Control, levels: int) -> Control:
 	return margin
 
 
-## Rebuild a completed subagent's activity panel from stored events on reload — the same faint purple block shown live, its caption settled and inner steps collapsed, a failed run's caption in the same error red it settled to live. Display-only (see _history_for_request).
-func _replay_subagent_activity(caption_text: String, events: Array, failed: bool = false) -> void:
-	var body := _new_subagent_panel()
+## Rebuild a completed subagent's activity panel from stored events on reload — the same faint purple block shown live, its caption settled and inner steps collapsed, a failed run's caption in the same error red it settled to live. Display-only (see _history_for_request). `pair_key` names the tool whose pair the panel folds into, matching where the live run rendered it.
+func _replay_subagent_activity(caption_text: String, events: Array, failed: bool = false, pair_key: String = "") -> void:
+	var body := _new_subagent_panel(_pair_details_for(pair_key))
 	var caption := Label.new()
 	caption.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	caption.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -4810,7 +5217,7 @@ func begin_title_task(model_label: String, system_prompt: String, prompt: String
 	_title_task_active = true
 	_title_task_debug = {"model": model_label, "system": system_prompt, "prompt": prompt}
 	_add_task_debug_button(_title_task_debug)
-	_title_task_caption = _build_title_task_rows(_new_task_panel(), _title_task_caption_text(), system_prompt, prompt)
+	_title_task_caption = _build_title_task_rows(_new_title_task_panel("Generating session title…"), _title_task_caption_text(), system_prompt, prompt)
 	set_process(true)
 	_follow_to_bottom()
 
@@ -4826,6 +5233,7 @@ func settle_title_task(model_label: String, system_prompt: String, prompt: Strin
 	_history.append(entry)
 	if is_instance_valid(_title_task_caption):
 		_title_task_caption.text = _title_task_done_caption(model_label, seconds)
+		_settle_fold_summary(_title_task_caption, _title_fold_summary(failed))
 		var body := _title_task_caption.get_parent() as VBoxContainer
 		_add_title_task_result(body, result, failed)
 		_add_title_task_stats(body, entry)
@@ -4850,7 +5258,7 @@ static func title_task_entry(model_label: String, system_prompt: String, prompt:
 ## Rebuild a completed title run's gray panel from its stored entry — settled caption, request disclosure, outcome row, and stats footer. Shared by history replay and a settle whose live panel is gone. The inspection button lands above the panel, matching the live order.
 func _replay_title_task(entry: Dictionary) -> void:
 	_add_task_debug_button(entry)
-	var body := _new_task_panel()
+	var body := _new_title_task_panel(_title_fold_summary(bool(entry.get("failed", false))))
 	_build_title_task_rows(body, _title_task_done_caption(String(entry.get("model", "")), float(entry.get("seconds", 0.0))), String(entry.get("system", "")), String(entry.get("prompt", "")))
 	_add_title_task_result(body, String(entry.get("result", "")), bool(entry.get("failed", false)))
 	_add_title_task_stats(body, entry)
@@ -4897,9 +5305,14 @@ func _title_task_done_caption(model_label: String, seconds: float) -> String:
 	return "Session title · %s (%02ds)" % [model_label, int(seconds)]
 
 
-## Create the faint gray panel that groups a background task's caption, request, and outcome (see _new_group_panel). Gray rather than a chat role's tint: the run belongs to the plugin, not the conversation.
-func _new_task_panel() -> VBoxContainer:
-	return _new_group_panel(GDLLMColors.color(GDLLMColors.TASK_BACKGROUND))
+## Create the faint gray panel that groups a title run's caption, request, and outcome (see _new_group_panel), behind its own condensed-feed fold summarized as `summary` — "Generating session title…" live, the settled wording on replay — so the whole run collapses to one line while the eye is closed. Gray rather than a chat role's tint: the run belongs to the plugin, not the conversation.
+func _new_title_task_panel(summary: String) -> VBoxContainer:
+	return _new_group_panel(GDLLMColors.color(GDLLMColors.TASK_BACKGROUND), _new_condensed_fold(summary, GDLLMColors.color(GDLLMColors.STATUS_CAPTION)))
+
+
+## The one-line settled wording of a title run for the condensed fold; failure is named on the line itself, since the folded panel's red row can't be seen through it.
+func _title_fold_summary(failed: bool) -> String:
+	return "Session title generation failed" if failed else "Generated session title"
 
 
 # --- Compaction summarization panels ---
@@ -4919,7 +5332,8 @@ func _open_compaction_run_panel(data: Dictionary) -> void:
 ## The skeleton both a live run and a reload build: the inspection row, the panel, its caption (text left to the caller — ticking live, settled on reload), and the request disclosure. Returns the body and caption so the live run can retitle and extend the panel it already streamed into, which is what keeps live and reload identical by construction (goal 2).
 func _build_compaction_run_panel(data: Dictionary) -> Dictionary:
 	_add_compaction_task_debug_button(data)
-	var body := _new_group_panel(GDLLMColors.color(GDLLMColors.COMPACTION_BACKGROUND))
+	var opening := "Summarizing the conversation around a focus…" if String(data.get("focus", "")) != "" else "Summarizing older history…"
+	var body := _new_group_panel(GDLLMColors.color(GDLLMColors.COMPACTION_BACKGROUND), _new_condensed_fold(opening, GDLLMColors.color(GDLLMColors.WARNING_CAPTION)))
 	var caption := Label.new()
 	caption.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	caption.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
@@ -4966,6 +5380,11 @@ func _settle_compaction_run_panel(body: VBoxContainer, caption: Label, entry: Di
 	row.text = ("✕ " if failed else "→ ") + String(entry.get("result", ""))
 	body.add_child(row)
 	_add_title_task_stats(body, entry)
+	# Settle the fold to the run's outcome; failure is named on the line itself, like the title run's.
+	if failed:
+		_settle_fold_summary(body, "Compaction summarization failed")
+	else:
+		_settle_fold_summary(body, "Summarized the conversation around a focus" if focus != "" else "Summarized older history")
 
 
 ## The inline request disclosure for a summarization run: the system prompt whole, the transcript prompt elided — a marathon head runs to hundreds of thousands of chars, which an inline fit-content label must never be asked to shape (the inspect row shows it whole in the shape-on-demand dialog).
@@ -5218,6 +5637,7 @@ class RunningSubagent:
 	var done: bool = false ## its run returned a usable reply (success or an "Error: …" string) rather than being cancelled; an aborted turn's commit uses this to tell a finished result from one to replace with a cancellation marker (see _commit_interrupted_tool_turn)
 	var map_key: String = "" ## the spec's long-file-map cache key ("" for non-map subagents); a completed map records it in _served_maps so the unchanged file isn't re-mapped
 	var failed: bool = false ## its run resolved to an "Error: …" reply, so the result must not be treated as a delivered map
+	var pair: Dictionary = {} ## the pending-pair entry of the call that launched this run ({} when none); while the feed is condensed, _process paints the run's liveness onto that pair's summary until _close_tool_pair flags the entry settled
 
 
 ## Drives one Claude-style progress caption: cycles a verb list, wiping the old word into the new with a sweeping block, optionally led by a braille spinner. Each instance owns its clock, so the live "Thinking…" block and the "generating response…" placeholder animate at once on their own verb lists.
