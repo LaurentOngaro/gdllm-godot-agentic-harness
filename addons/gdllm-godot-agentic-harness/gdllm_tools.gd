@@ -5965,6 +5965,8 @@ static func _edit_file_locked(args: Dictionary, ledger: SessionLedger) -> Dictio
 	if file == null:
 		return _plain(_file_open_error(resolved, "edit"))
 	var original := file.get_as_text()
+	# GDScript releases a FileAccess at function exit, not last use — left open here, this read handle survives into the write below, and on Windows a safe-save read holds deny-write sharing, so the engine's own rename over the same file dies against it.
+	file.close()
 	var replace_all := _arg_bool(args, EDIT_REPLACE_ALL_KEYS)
 	var count := original.count(old_text)
 	var edit_at := -1
@@ -7090,6 +7092,8 @@ static func _edit_file_run_engine(extra_args: Array, done_pattern := "", timeout
 			OS.delay_msec(10)
 	_live_check_pids.erase(pid)
 	output += _edit_file_drain_pipe(pipe["stdio"]) + _edit_file_drain_pipe(pipe["stderr"])
+	# Windows children emit CRLF; the sentinel patterns' (?m)$ and every line classifier downstream assume bare \n, and the \r is invisible in any quoted diagnostic.
+	output = output.replace("\r\n", "\n")
 	if killed:
 		return {"ok": false, "why": "hung and was killed after %.1f seconds (the editor or machine may have been busy)%s" % [timeout_ms / 1000.0, _check_death_note(output)], "output": output, "exit_code": -1, "killed": true}
 	var exit_code := OS.get_process_exit_code(pid)
