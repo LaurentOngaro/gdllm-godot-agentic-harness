@@ -11,7 +11,7 @@ const KIND_OLLAMA := "ollama" ## Native Ollama wire format (/api/chat NDJSON), u
 const KIND_OPENAI := "openai" ## OpenAI-compatible wire format (/v1/chat/completions SSE), used by vLLM, Poolside, etc.
 const KIND_ANTHROPIC := "anthropic" ## Anthropic Messages API wire format (/v1/messages SSE), used by the Claude models.
 
-const DEFAULT_OLLAMA_LOCAL_BASE := "http://localhost:11434" ## Seed endpoint for the first-run local source; the pre-multi-source default.
+const DEFAULT_OLLAMA_LOCAL_BASE := "http://localhost:11434" ## Seed endpoint for the first-run local Ollama source.
 const DEFAULT_ANTHROPIC_BASE := "https://api.anthropic.com" ## Anthropic's API host; the same for every account, so the Connections dialog prefills it when a row switches to the Anthropic kind.
 
 
@@ -29,28 +29,28 @@ static func save_sources(sources: Array) -> void:
 	EditorInterface.get_editor_settings().set_setting(SETTINGS_KEY, JSON.stringify(sources))
 
 
-## Seed the sources list on first run if it's unset, carrying the pre-multi-source endpoint onto the local source. Idempotent — leaves an existing list untouched.
-static func ensure_seeded(local_base: String = DEFAULT_OLLAMA_LOCAL_BASE) -> void:
+## Seed the sources list on first run if it's unset — every template disabled, so no unconfigured endpoint is swept for models (and errors) before the user has set anything up. Idempotent — leaves an existing list untouched.
+static func ensure_seeded() -> void:
 	var es := EditorInterface.get_editor_settings()
 	if es.has_setting(SETTINGS_KEY):
 		return
-	save_sources(default_sources(local_base))
+	save_sources(default_sources())
 
 
-## The first-run source list: the migrated local Ollama plus ready-to-fill templates for Ollama Cloud, a local vLLM, Poolside, and Anthropic (blank keys). Paste a key into the cloud ones via the Connections dialog to enable them.
-static func default_sources(local_base: String = DEFAULT_OLLAMA_LOCAL_BASE) -> Array:
+## The first-run source list: ready-to-fill templates for a local Ollama, Ollama Cloud, a local vLLM, Poolside, and Anthropic (blank keys). Every row starts disabled — enable yours in the Connections dialog once its endpoint or key is in.
+static func default_sources() -> Array:
 	return [
-		{"id": "ollama-local", "name": "Ollama (Local)", "kind": KIND_OLLAMA, "base_url": local_base, "api_key": "", "enabled": true},
-		{"id": "ollama-cloud", "name": "Ollama Cloud", "kind": KIND_OLLAMA, "base_url": "https://ollama.com", "api_key": "", "enabled": true},
-		{"id": "vllm-local", "name": "vLLM (Local)", "kind": KIND_OPENAI, "base_url": "http://localhost:8000/v1", "api_key": "", "enabled": true},
-		{"id": "poolside", "name": "Poolside", "kind": KIND_OPENAI, "base_url": "https://inference.poolside.ai/v1", "api_key": "", "enabled": true},
+		{"id": "ollama-local", "name": "Ollama (Local)", "kind": KIND_OLLAMA, "base_url": DEFAULT_OLLAMA_LOCAL_BASE, "api_key": "", "enabled": false},
+		{"id": "ollama-cloud", "name": "Ollama Cloud", "kind": KIND_OLLAMA, "base_url": "https://ollama.com", "api_key": "", "enabled": false},
+		{"id": "vllm-local", "name": "vLLM (Local)", "kind": KIND_OPENAI, "base_url": "http://localhost:8000/v1", "api_key": "", "enabled": false},
+		{"id": "poolside", "name": "Poolside", "kind": KIND_OPENAI, "base_url": "https://inference.poolside.ai/v1", "api_key": "", "enabled": false},
 		_anthropic_template(),
 	]
 
 
-## The ready-to-fill Anthropic source row, shared by the first-run seed and the one-time append for installs that predate it.
+## The ready-to-fill Anthropic source row, shared by the first-run seed and the one-time append for installs that predate it. Disabled until the user pastes a key and flips it on — a keyless sweep of the live endpoint only produces auth errors.
 static func _anthropic_template() -> Dictionary:
-	return {"id": "anthropic", "name": "Anthropic", "kind": KIND_ANTHROPIC, "base_url": DEFAULT_ANTHROPIC_BASE, "api_key": "", "enabled": true}
+	return {"id": "anthropic", "name": "Anthropic", "kind": KIND_ANTHROPIC, "base_url": DEFAULT_ANTHROPIC_BASE, "api_key": "", "enabled": false}
 
 
 ## Append the Anthropic template for an install whose sources predate it — a first run already carries it via default_sources. Offered exactly once, tracked in TEMPLATES_SEEDED_KEY, so a user who deletes the row never sees it come back; an Anthropic source the user already added by hand counts as offered too.

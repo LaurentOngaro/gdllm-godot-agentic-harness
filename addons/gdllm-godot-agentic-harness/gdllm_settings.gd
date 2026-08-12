@@ -2,7 +2,6 @@
 class_name GDLLMSettings
 ## Central home for the plugin's editor settings: key names, defaults, and helpers. Settings live in EditorSettings (per-developer, never committed)
 
-const API_BASE := "gdllm/connection/api_base" ## Retired: the pre-multi-source single endpoint. Read once at register() to seed the local source, then erased. Sources now live under GDLLMSources.SETTINGS_KEY.
 const CHAT_MODEL := "gdllm/models/chat"
 const TASKS_MODEL := "gdllm/models/tasks" ## Small model for background chores: session-title summarization and read_file's long-file maps.
 
@@ -21,6 +20,9 @@ const AUTO_EXPAND_TOOL_CALLS := "gdllm/interface/auto_expand_tool_calls"
 
 ## The tool-result counterpart to AUTO_EXPAND_TOOL_CALLS, split out because results are usually far longer than the calls that produced them.
 const AUTO_EXPAND_TOOL_RESULTS := "gdllm/interface/auto_expand_tool_results"
+
+## Whether the session log condenses each tool call and its result into a one-line summary ("Read player.gd:0-32") that clicks open to the full pair — the closed-eye state of the header's eye toggle. On by default — most users want the boiled-down feed — with the open eye showing the full transparent feed. The detail is never hidden, only folded (see GDLLMChatSession._open_tool_pair).
+const CONDENSED_FEED := "gdllm/interface/condensed_feed"
 
 ## Whether model replies render as Markdown through the optional MarkdownLabel addon when it is installed. Off renders replies verbatim in a plain RichTextLabel — the same fallback a project without the addon gets automatically — for users who keep MarkdownLabel installed for their game but don't want this plugin using it (see GDLLMMarkdown).
 const MARKDOWN_RESPONSES := "gdllm/interface/render_markdown_responses"
@@ -78,6 +80,7 @@ const DEFAULT_TIME_FORMAT := "12-hour"
 const DEFAULT_AUTO_EXPAND_THINKING := true
 const DEFAULT_AUTO_EXPAND_TOOL_CALLS := false
 const DEFAULT_AUTO_EXPAND_TOOL_RESULTS := false
+const DEFAULT_CONDENSED_FEED := true
 const DEFAULT_MARKDOWN_RESPONSES := true
 const DEFAULT_MAX_PARALLEL_SUBAGENTS := 4
 const DEFAULT_NEW_SESSION_EDITS := false
@@ -120,18 +123,12 @@ static var headless_allow_outside_tool_calls := DEFAULT_ALLOW_OUTSIDE_TOOL_CALLS
 ## Register the settings so they show up in Editor → Editor Settings and persist across sessions. Idempotent — safe to call on every plugin load; existing values are kept.
 static func register() -> void:
 	var es := EditorInterface.get_editor_settings()
-	# carry values off the pre-"Models"-page keys so a prior install's choices aren't lost
-	_migrate(es, "gdllm/chat/model", CHAT_MODEL)
-	# Carry a prior install's sources onto the renamed key ("sources" -> "sources_fallback") before seeding decides the key is empty, so configured sources and keys aren't lost.
-	_migrate(es, "gdllm/connection/sources", GDLLMSources.SETTINGS_KEY)
-	# Seed the multi-source list, carrying the pre-multi-source single endpoint onto the local source, then retire the flat API_BASE key (sources live under GDLLMSources.SETTINGS_KEY now).
-	var local_base := String(es.get_setting(API_BASE)) if es.has_setting(API_BASE) else GDLLMSources.DEFAULT_OLLAMA_LOCAL_BASE
-	GDLLMSources.ensure_seeded(local_base)
-	es.erase(API_BASE)
+	# Seed the multi-source list on first run; every template starts disabled (see GDLLMSources.default_sources).
+	GDLLMSources.ensure_seeded()
 	# An install seeded before the Anthropic kind existed gets its template row appended once, so the Connections dialog shows it without a hand-added source (deleting it sticks; see GDLLMSources.TEMPLATES_SEEDED_KEY).
 	GDLLMSources.ensure_anthropic_template()
 	# Render the raw sources JSON as a multi-line text box, labeled "Sources Fallback" (the Connections dialog is the primary editor; this is the readable fallback). ensure_seeded already set the value, so _define only adds the multiline property info.
-	_define(es, GDLLMSources.SETTINGS_KEY, JSON.stringify(GDLLMSources.default_sources(local_base)), PROPERTY_HINT_MULTILINE_TEXT)
+	_define(es, GDLLMSources.SETTINGS_KEY, JSON.stringify(GDLLMSources.default_sources()), PROPERTY_HINT_MULTILINE_TEXT)
 	# Same fallback pattern for the per-model effort-level and cache-TTL map (the Effort Configuration dialog is the primary editor; see GDLLMEfforts).
 	_define(es, GDLLMEfforts.SETTINGS_KEY, "{}", PROPERTY_HINT_MULTILINE_TEXT)
 	# And for the ordered favorite-models list (the Favorite Models dialog is the primary editor; see GDLLMFavorites).
@@ -149,6 +146,7 @@ static func register() -> void:
 	_define_bool(es, AUTO_EXPAND_THINKING, DEFAULT_AUTO_EXPAND_THINKING)
 	_define_bool(es, AUTO_EXPAND_TOOL_CALLS, DEFAULT_AUTO_EXPAND_TOOL_CALLS)
 	_define_bool(es, AUTO_EXPAND_TOOL_RESULTS, DEFAULT_AUTO_EXPAND_TOOL_RESULTS)
+	_define_bool(es, CONDENSED_FEED, DEFAULT_CONDENSED_FEED)
 	_define_bool(es, MARKDOWN_RESPONSES, DEFAULT_MARKDOWN_RESPONSES)
 	_define_int(es, INPUT_HEIGHT, DEFAULT_INPUT_HEIGHT, "%d,%d,1" % [MIN_INPUT_HEIGHT, MAX_INPUT_HEIGHT])
 	# or_greater lets the spinbox go past 64 by typing, while 0 stands for "no cap".
@@ -185,15 +183,6 @@ static func register() -> void:
 			_define_int(es, tunable_key, spec["default"], GDLLMTunables.range_hint(spec))
 	# Seed the pickers from last session's cached list so boot never waits on model HTTP; a fresh sweep runs only on demand.
 	load_cached_models()
-
-
-## Carry a value from a pre-rename key onto its new key and erase the stale one, so old entries don't linger in the settings dialog. No-op once nothing predates the rename.
-static func _migrate(es: EditorSettings, old_key: String, new_key: String) -> void:
-	if not es.has_setting(old_key):
-		return
-	if not es.has_setting(new_key):
-		es.set_setting(new_key, es.get_setting(old_key))
-	es.erase(old_key)
 
 
 static func _define(es: EditorSettings, key: String, default: String, hint: int = PROPERTY_HINT_NONE, hint_string: String = "") -> void:
@@ -358,6 +347,11 @@ static func is_auto_expand_tool_results() -> bool:
 	return bool(EditorInterface.get_editor_settings().get_setting(AUTO_EXPAND_TOOL_RESULTS))
 
 
+## Whether the session log is condensed — tool call/result pairs folded to one-line summaries (see GDLLMChatSession._apply_condensed_mode).
+static func is_condensed_feed() -> bool:
+	return bool(EditorInterface.get_editor_settings().get_setting(CONDENSED_FEED))
+
+
 ## Whether model replies may render as Markdown; the MarkdownLabel addon must also be installed (GDLLMMarkdown.enabled combines the two).
 static func is_markdown_responses_enabled() -> bool:
 	return bool(EditorInterface.get_editor_settings().get_setting(MARKDOWN_RESPONSES))
@@ -376,6 +370,11 @@ static func set_auto_expand_tool_calls(value: bool) -> void:
 ## Persist the auto-expand-tool-results preference; the tool-result counterpart to set_auto_expand_tool_calls.
 static func set_auto_expand_tool_results(value: bool) -> void:
 	EditorInterface.get_editor_settings().set_setting(AUTO_EXPAND_TOOL_RESULTS, value)
+
+
+## Persist the condensed-feed preference; written by the header's eye toggle and routed like the auto-expand setters, so every session's header follows.
+static func set_condensed_feed(value: bool) -> void:
+	EditorInterface.get_editor_settings().set_setting(CONDENSED_FEED, value)
 
 
 ## Height of the chat message box; clamped so a hand-edited value can't push the dock's minimum size past its slot.

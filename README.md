@@ -23,7 +23,8 @@ By integrating this harness directly into the editor, GDLLM starts ahead of more
 
 - Adds a familiar "chat" panel to manage agent sessions.
 - Give your agents full access to all Godot engine features.
-- Every action an agent takes is fully surfaced and transparent. Inspect complete model context at any turn.
+- Every action an agent takes is fully surfaced and transparent. Optionally toggle to a condensed feed which folds each tool call and its result into expandable one-line summaries.
+- Inspect complete model context at any turn.
 - Edits, whenever possible, are automatically engine-validated after changes and errors are surfaced to agents. 
 - Integrated engine documentation, pulling from the same cached data the in-editor documentation browser uses.
 - Respects `AGENTS.md`. `GDLLM.md` optionally overrides any `AGENTS.md` file if present.
