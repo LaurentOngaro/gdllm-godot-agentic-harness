@@ -12,6 +12,7 @@ signal store_failed(message: String)
 const DIR := "user://gdllm"
 const PATH := "user://gdllm/sessions.json"
 const DEFAULT_TITLE := "New chat"
+const ECHO_THINKING_TYPES: Array[String] = ["thinking", "redacted_thinking", "reasoning"] ## The provider-echo block types that ARE stored reasoning (Anthropic's thinking/redacted_thinking, the Responses API's reasoning items) — shared with the manage dialog's Thinking-size column, so what Clear Thinking strips and what the column counts can never drift apart (see strip_echo_thinking).
 # The save-debounce window is user-configurable — see GDLLMTunables' gdllm/interface section.
 
 var sessions: Array[Dictionary] = [] ## Ordered roster; each entry is a session record (see _new_record).
@@ -170,13 +171,13 @@ func clear_thinking(id: String) -> bool:
 	return changed
 
 
-## Drop the thinking/redacted_thinking blocks a provider echo stored beside a tool-call turn (see AnthropicAdapter's assistant_blocks), so "Clear Thinking" removes reasoning from disk and from any resend, not just from the display fields. Returns true if anything was removed.
+## Drop the reasoning blocks a provider echo stored beside a tool-call turn (see ECHO_THINKING_TYPES; summary and encrypted content alike — see LLMClient.last_assistant_blocks), so "Clear Thinking" removes reasoning from disk and from any resend, not just from the display fields. Returns true if anything was removed.
 static func strip_echo_thinking(msg: Dictionary) -> bool:
 	if not (msg.get("assistant_blocks") is Array):
 		return false
 	var kept: Array = []
 	for block in msg["assistant_blocks"]:
-		if not (block is Dictionary and String(block.get("type", "")) in ["thinking", "redacted_thinking"]):
+		if not (block is Dictionary and String(block.get("type", "")) in ECHO_THINKING_TYPES):
 			kept.append(block)
 	if kept.size() == msg["assistant_blocks"].size():
 		return false
@@ -196,7 +197,7 @@ func set_model(id: String, model: String) -> void:
 	save()
 
 
-## Remember a session's reasoning-effort selection ("" = Default) and persist. No-op when absent or unchanged.
+## Remember a session's reasoning-effort selection ("" = Default) and persist. No-op when absent or unchanged. Every record carries the key — seeded from the model's remembered level at creation, stamped Default by _normalize for older files — so the stored value is always the session's authoritative choice.
 func set_effort(id: String, effort: String) -> void:
 	var record := get_session(id)
 	if record.is_empty() or String(record.get("effort", "")) == effort:
@@ -261,6 +262,7 @@ func _new_record() -> Dictionary:
 		"make_changes": GDLLMSettings.is_new_session_edits_on(), ## Per-session write permission; whether a fresh session starts with it on is the user's editor setting.
 		"delete_files": GDLLMSettings.is_new_session_delete_on(), ## Per-session delete permission, seeded the same way; existing sessions keep their stored state.
 		"tools_enabled": true,
+		"effort": GDLLMEfforts.remembered_level_for(String(GDLLMSettings.get_chat_model())), ## Seeded once from the model's last user-picked level (see GDLLMEfforts.remember_level), so a new session opens at the effort its user actually runs the model at; from here on the record's own value is authoritative.
 		"history": [],
 	}
 
@@ -276,6 +278,8 @@ func _normalize(record: Dictionary, legacy_make_changes: bool) -> Dictionary:
 	record["is_open"] = bool(record.get("is_open", true))
 	record["make_changes"] = bool(record.get("make_changes", legacy_make_changes))
 	record["tools_enabled"] = bool(record.get("tools_enabled", true))
+	# A record from before effort was stored per session ran at Default; stamping that explicitly keeps the per-model memory (which post-dates those records) from silently changing what an old session sends.
+	record["effort"] = String(record.get("effort", ""))
 	record.erase("context_tokens") # retired cache: token columns now derive from history, so shed the stale field from older files
 	if not (record.get("history") is Array):
 		record["history"] = []

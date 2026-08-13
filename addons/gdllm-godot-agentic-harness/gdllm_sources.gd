@@ -9,10 +9,14 @@ const QUALIFIER := "::" ## Separates a source id from a model name in a qualifie
 
 const KIND_OLLAMA := "ollama" ## Native Ollama wire format (/api/chat NDJSON), used by local and cloud alike.
 const KIND_OPENAI := "openai" ## OpenAI-compatible wire format (/v1/chat/completions SSE), used by vLLM, Poolside, etc.
+const KIND_OPENAI_RESPONSES := "openai-responses" ## OpenAI Responses API wire format (/v1/responses SSE) — the newer OpenAI API, which GPT-5.6-class models require for reasoning effort with tools; /v1/chat/completions rejects that combination on them.
+const KIND_OPENAI_CHATGPT := "openai-chatgpt" ## The Responses wire format served from OpenAI's ChatGPT backend, authenticated with a ChatGPT sign-in instead of an API key (see GDLLMOAuth) — how a Plus/Pro subscription drives the harness without API billing.
 const KIND_ANTHROPIC := "anthropic" ## Anthropic Messages API wire format (/v1/messages SSE), used by the Claude models.
 
 const DEFAULT_OLLAMA_LOCAL_BASE := "http://localhost:11434" ## Seed endpoint for the first-run local Ollama source.
 const DEFAULT_ANTHROPIC_BASE := "https://api.anthropic.com" ## Anthropic's API host; the same for every account, so the Connections dialog prefills it when a row switches to the Anthropic kind.
+const DEFAULT_OPENAI_BASE := "https://api.openai.com/v1" ## OpenAI's own API base; the same for every account, so the Connections dialog prefills it when a row switches to the Responses kind (third-party servers speak the chat-completions kind instead).
+const DEFAULT_CHATGPT_BASE := "https://chatgpt.com/backend-api/codex" ## The ChatGPT subscription backend; the same for every account, prefilled like its siblings when a row switches to the subscription kind.
 
 
 ## The configured sources as an Array of source Dictionaries, or the default seed when nothing is stored yet or the stored value is unparseable.
@@ -37,15 +41,27 @@ static func ensure_seeded() -> void:
 	save_sources(default_sources())
 
 
-## The first-run source list: ready-to-fill templates for a local Ollama, Ollama Cloud, a local vLLM, Poolside, and Anthropic (blank keys). Every row starts disabled — enable yours in the Connections dialog once its endpoint or key is in.
+## The first-run source list: ready-to-fill templates for a local Ollama, Ollama Cloud, a local vLLM, Poolside, OpenAI, and Anthropic (blank keys). Every row starts disabled — enable yours in the Connections dialog once its endpoint or key is in.
 static func default_sources() -> Array:
 	return [
 		{"id": "ollama-local", "name": "Ollama (Local)", "kind": KIND_OLLAMA, "base_url": DEFAULT_OLLAMA_LOCAL_BASE, "api_key": "", "enabled": false},
 		{"id": "ollama-cloud", "name": "Ollama Cloud", "kind": KIND_OLLAMA, "base_url": "https://ollama.com", "api_key": "", "enabled": false},
 		{"id": "vllm-local", "name": "vLLM (Local)", "kind": KIND_OPENAI, "base_url": "http://localhost:8000/v1", "api_key": "", "enabled": false},
 		{"id": "poolside", "name": "Poolside", "kind": KIND_OPENAI, "base_url": "https://inference.poolside.ai/v1", "api_key": "", "enabled": false},
+		_openai_template(),
+		_chatgpt_template(),
 		_anthropic_template(),
 	]
+
+
+## The ready-to-fill ChatGPT subscription source row (see KIND_OPENAI_CHATGPT), shared by the first-run seed and the one-time append for installs that predate it. Disabled until the user signs in and flips it on, like every template — there is no key to paste; the Connections row carries a Sign in with ChatGPT button instead.
+static func _chatgpt_template() -> Dictionary:
+	return {"id": "openai-chatgpt", "name": "OpenAI (ChatGPT)", "kind": KIND_OPENAI_CHATGPT, "base_url": DEFAULT_CHATGPT_BASE, "api_key": "", "enabled": false}
+
+
+## The ready-to-fill OpenAI source row on the Responses kind (see KIND_OPENAI_RESPONSES), shared by the first-run seed and the one-time append for installs that predate it. Disabled until the user pastes a key and flips it on, like every template.
+static func _openai_template() -> Dictionary:
+	return {"id": "openai", "name": "OpenAI", "kind": KIND_OPENAI_RESPONSES, "base_url": DEFAULT_OPENAI_BASE, "api_key": "", "enabled": false}
 
 
 ## The ready-to-fill Anthropic source row, shared by the first-run seed and the one-time append for installs that predate it. Disabled until the user pastes a key and flips it on — a keyless sweep of the live endpoint only produces auth errors.
@@ -53,27 +69,38 @@ static func _anthropic_template() -> Dictionary:
 	return {"id": "anthropic", "name": "Anthropic", "kind": KIND_ANTHROPIC, "base_url": DEFAULT_ANTHROPIC_BASE, "api_key": "", "enabled": false}
 
 
-## Append the Anthropic template for an install whose sources predate it — a first run already carries it via default_sources. Offered exactly once, tracked in TEMPLATES_SEEDED_KEY, so a user who deletes the row never sees it come back; an Anthropic source the user already added by hand counts as offered too.
-static func ensure_anthropic_template() -> void:
+## Append each post-release template row for an install whose sources predate it — a first run already carries them all via default_sources. Each is offered exactly once, tracked by its id in TEMPLATES_SEEDED_KEY, so a deleted row never resurrects; a source the user already points at the provider — by the template's id or by its kind — counts as offered too.
+static func ensure_templates() -> void:
 	var es := EditorInterface.get_editor_settings()
 	var seeded: Array = []
 	if es.has_setting(TEMPLATES_SEEDED_KEY):
 		var parsed: Variant = JSON.parse_string(String(es.get_setting(TEMPLATES_SEEDED_KEY)))
 		if parsed is Array:
 			seeded = parsed
-	if seeded.has("anthropic"):
-		return
-	seeded.append("anthropic")
-	es.set_setting(TEMPLATES_SEEDED_KEY, JSON.stringify(seeded))
-	# Nothing to offer when the user already points anywhere at Anthropic — by the template's id or by kind.
-	if not resolve("anthropic").is_empty():
-		return
 	var sources := get_sources()
+	var seeded_changed := false
+	var sources_changed := false
+	for template: Dictionary in [_anthropic_template(), _openai_template(), _chatgpt_template()]:
+		var template_id := String(template["id"])
+		if seeded.has(template_id):
+			continue
+		seeded.append(template_id)
+		seeded_changed = true
+		if not _template_offered(sources, template):
+			sources.append(template)
+			sources_changed = true
+	if sources_changed:
+		save_sources(sources)
+	if seeded_changed:
+		es.set_setting(TEMPLATES_SEEDED_KEY, JSON.stringify(seeded))
+
+
+## Whether `sources` already carries the template's provider — by its id, or by any source of its kind the user added by hand.
+static func _template_offered(sources: Array, template: Dictionary) -> bool:
 	for source in sources:
-		if source is Dictionary and String(source.get("kind", "")) == KIND_ANTHROPIC:
-			return
-	sources.append(_anthropic_template())
-	save_sources(sources)
+		if source is Dictionary and (String(source.get("id", "")) == String(template["id"]) or String(source.get("kind", "")) == String(template["kind"])):
+			return true
+	return false
 
 
 ## Whether a source should be queried for models. Defaults to true when the key is absent, so sources stored before this flag existed stay on; the Connections dialog's per-row toggle turns it off for a connection that's down or one the user doesn't want swept.

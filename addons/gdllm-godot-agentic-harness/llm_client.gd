@@ -22,7 +22,7 @@ var cache_ttl: int = 0 ## The session's effective prompt-cache TTL in seconds, a
 var source_id: String = "" ## Id of the configured source, carried from configure_from so a stale-source refusal can name it.
 var source_stale: bool = false ## The configured source id no longer resolves (deleted or renamed; see GDLLMSources.resolve_qualified); every send refuses loudly instead of running on rerouted connection details.
 var http_request: HTTPRequest
-var last_assistant_blocks: Array = [] ## The provider's raw assistant content blocks for the request that just finished in tool calls, when its adapter needs them echoed back to continue the loop (Anthropic; see LLMAdapter's assistant_blocks event). Empty for providers whose canonical echo suffices. Read it right after tool_calls_received and store it beside the turn.
+var last_assistant_blocks: Array = [] ## The provider's raw assistant content blocks for the request that just finished in tool calls, when its adapter needs them echoed back to continue the loop (Anthropic, the OpenAI Responses API; see LLMAdapter's assistant_blocks event). Empty for providers whose canonical echo suffices. Read it right after tool_calls_received and store it beside the turn.
 var last_models_error: String = "" ## Why the latest fetch_models resolved empty ("" = no failure, the source is genuinely bare); the model sweep reads it so an empty source is reported with its cause instead of a bare "returned nothing".
 var _tags_http_request: HTTPRequest ## Separate transport so a model-list fetch can't collide with an in-flight chat request.
 var _tags_pending: bool = false ## True between issuing a model-list request and its first terminal event (response, request error, or timeout); guards models_received against a double-emit when a late response and the timeout race.
@@ -31,6 +31,7 @@ var _context_pending: bool = false ## True between issuing a probe and its first
 var _context_model: String = "" ## The bare model the pending probe asked about, echoed on the emit.
 var _context_probe_serial: int = 0 ## Bumped per probe; a superseded probe's timeout timer keeps ticking after its request is cancelled, and the serial keeps it from resolving the newer probe as empty.
 var _busy: bool = false
+var _auth_epoch: int = 0 ## Bumped by cancel(), so a subscription token refresh that outlives its request's cancellation stands down instead of resurrecting it — the shared _busy flag alone can't tell "cancelled" from "a newer send re-latched busy" (see _adopt_fresh_subscription_token).
 var _completion_est_in: int = 0 ## chars-per-token estimate of the completion request payload (taken in _post), the non-streamed counterpart of _stream_est_in.
 
 ## Streaming chat state. HTTPRequest buffers the whole body, so chat runs on an owned transport polled from _process instead — that's the only way to read a reply (thinking + content) chunk by chunk. The transport is LLMStreamTransport rather than a raw HTTPClient because HTTPClient reads only the Content-Length and chunked body framings, filing an unframed (connection-delimited) streaming body — the shape koboldcpp's built-in server sends — as empty.
@@ -107,6 +108,24 @@ func _make_adapter() -> LLMAdapter:
 	return LLMAdapter.for_kind(adapter_kind)
 
 
+## For a ChatGPT-subscription source, adopt a current access token as this request's api_key — refreshed silently through the stored refresh token when stale, since access tokens expire within hours and a long-idle session's next send must not ride a dead one. True to proceed; false when the request must not go out (never signed in, the refresh failed, or a cancel landed during it), the failure emitted with sign-in as the named fix (goal 3). Any other kind passes straight through.
+func _adopt_fresh_subscription_token() -> bool:
+	if adapter_kind != GDLLMSources.KIND_OPENAI_CHATGPT:
+		return true
+	# Busy is latched across the await so a second send can't slip in mid-refresh; a cancel() during it bumps the epoch, which reads here as "stand down" — the flag alone can't be the sentinel, since a send issued after the cancel re-latches it and must not be hijacked by this stale continuation.
+	_busy = true
+	var epoch := _auth_epoch
+	var token := await GDLLMOAuth.ensure_fresh(source_id, self)
+	if epoch != _auth_epoch or not _busy:
+		return false # cancelled while refreshing; silence is the cancel contract
+	_busy = false
+	if token == "":
+		call_deferred("_emit_request_failed", "Not signed in to ChatGPT for source \"%s\" (or the sign-in expired and couldn't refresh). Use Sign in with ChatGPT in the Connections dialog — the ⚙ beside the model picker." % source_id)
+		return false
+	api_key = token
+	return true
+
+
 ## The header lines every request to this source carries: JSON content type, plus whatever auth scheme the adapter's provider wants for the configured key.
 func _request_headers(adapter: LLMAdapter) -> PackedStringArray:
 	var headers := PackedStringArray(["Content-Type: application/json"])
@@ -125,7 +144,8 @@ func cancel() -> bool:
 		_teardown_stream() # closes the socket, stops polling, clears _busy — but stays silent
 		return true
 	if _busy:
-		# Non-streaming path (completions): drop the pending HTTPRequest and clear busy ourselves, since a cancelled request never fires request_completed.
+		# Non-streaming path (completions), or a subscription token refresh still ahead of its request: drop the pending HTTPRequest and clear busy ourselves, since a cancelled request never fires request_completed; the epoch bump tells an in-flight refresh its request is dead (see _adopt_fresh_subscription_token).
+		_auth_epoch += 1
 		http_request.cancel_request()
 		_busy = false
 		return true
@@ -135,6 +155,14 @@ func cancel() -> bool:
 ## Fetch installed model names for this source (path/parse set by the adapter); results arrive via `models_received`. Always emits within GDLLMTunables.MODEL_FETCH_TIMEOUT — an empty list on any failure or timeout, with the cause left on `last_models_error` — so a caller awaiting the signal per source never stalls a sweep.
 func fetch_models() -> void:
 	last_models_error = ""
+	var static_names := _make_adapter().static_models()
+	if not static_names.is_empty():
+		# This source's backend publishes no listing endpoint, so its maintained set stands in without touching the network — emitted deferred so an awaiting sweep's await always lands first.
+		_tags_pending = true
+		var names := PackedStringArray(static_names)
+		names.sort()
+		call_deferred("_emit_models", names)
+		return
 	_tags_pending = true
 	# The deadline is armed before anything can suspend, and through the main loop rather than get_tree() because this node may not be in the tree yet — it must cover the tree_entered wait below as well as an unreachable host that never sends a RST, or a fetch stuck on either would break the always-emits promise.
 	(Engine.get_main_loop() as SceneTree).create_timer(GDLLMTunables.getf(GDLLMTunables.MODEL_FETCH_TIMEOUT)).timeout.connect(_on_tags_timeout)
@@ -191,9 +219,13 @@ func _on_tags_completed(result: int, response_code: int, _headers: PackedStringA
 func _kind_404_hint() -> String:
 	if adapter_kind == GDLLMSources.KIND_OPENAI:
 		return "check the source's URL and Kind: a bare http://host:port, a base ending in /v1, or a full endpoint like …/v1/chat/completions all work for an OpenAI-compatible server — an Ollama server needs the Ollama kind instead"
+	if adapter_kind == GDLLMSources.KIND_OPENAI_RESPONSES:
+		return "check the source's URL and Kind: OpenAI's own API lives at https://api.openai.com/v1 (pasting the full …/v1/responses endpoint works too) — a third-party server usually wants the OpenAI-Compatible (Chat Completions) kind instead"
+	if adapter_kind == GDLLMSources.KIND_OPENAI_CHATGPT:
+		return "check the source's URL: the ChatGPT subscription backend lives at %s, which the Connections dialog prefills — a 404 usually means the URL was edited" % GDLLMSources.DEFAULT_CHATGPT_BASE
 	if adapter_kind == GDLLMSources.KIND_ANTHROPIC:
 		return "check the source's URL: Anthropic wants https://api.anthropic.com (pasting the full …/v1/messages endpoint works too)"
-	return "check the source's URL and Kind: an Ollama server takes a bare http://host:port or a full endpoint like …/api/chat — an OpenAI-compatible server (LM Studio, llama.cpp, koboldcpp, vLLM, most others...) needs the OpenAI kind instead"
+	return "check the source's URL and Kind: an Ollama server takes a bare http://host:port or a full endpoint like …/api/chat — an OpenAI-compatible server (LM Studio, llama.cpp, koboldcpp, vLLM, most others...) needs the OpenAI-Compatible (Chat Completions) kind instead"
 
 
 ## Emit the model list exactly once per fetch, so a late response and the timeout can't both fire models_received (which would double-count the source in a sweep).
@@ -205,6 +237,11 @@ func _emit_models(names: PackedStringArray) -> void:
 
 
 ## Ask this source for the configured model's maximum context window (Ollama's /api/show, Anthropic's /v1/models/{id}, an OpenAI-compatible /v1/models list read for a vendor window field — see LLMAdapter.context_probe) and resolve via context_window_received within GDLLMTunables.MODEL_FETCH_TIMEOUT: the reported window, or 0 on any failure (an OpenAI-compatible server carrying no such field resolves to 0, an honest unknown). Returns false without emitting when this source's API offers no probe at all or the transport isn't in the tree yet, so the caller shows an honest unknown instead of waiting; a newer probe supersedes a pending one, which then never emits — its reply would describe a model the caller already left.
+## Whether this source's API offers a context-window probe at all (see LLMAdapter.context_probe): false marks the window as unknowable from the wire — a settled fact the caller can act on now — as opposed to fetch_context_window's false, which can also mean the probe merely couldn't run yet.
+func has_context_probe() -> bool:
+	return not _make_adapter().context_probe(model).is_empty()
+
+
 func fetch_context_window() -> bool:
 	var adapter := _make_adapter()
 	var probe := adapter.context_probe(model)
@@ -269,6 +306,8 @@ func send_chat_request(messages: Array, system_prompt: String = "", tools: Array
 		# A visible failure, not a silent drop: without request_failed the caller waits forever on a request that never left.
 		push_warning("LLMClient busy; ignoring request")
 		request_failed.emit("Client busy: a request is already in flight, so this one was not sent.")
+		return
+	if not await _adopt_fresh_subscription_token():
 		return
 	var full_messages: Array = []
 	if system_prompt != "":
@@ -402,6 +441,8 @@ func _handle_stream_line(line: String) -> void:
 func _apply_stream_event(event: Dictionary) -> void:
 	_stream_saw_event = true
 	match String(event.get("type", "")):
+		"progress":
+			pass # a recognized frame with nothing streamable yet (a Responses lifecycle event); emitted only so the wire-format guard above knows the reply parses before the first visible delta arrives
 		"thinking":
 			var thinking := String(event.get("text", ""))
 			if thinking != "":
@@ -445,10 +486,10 @@ func _finish_stream() -> void:
 		_stream_buffer = ""
 	_teardown_stream()
 	if _stream_error != "":
-		request_failed.emit(_stream_error + _effort_hint(_stream_error))
+		request_failed.emit(_stream_error + _failure_hints(_stream_error))
 	elif _stream_bad_code != 0:
 		var body := _stream_buffer.strip_edges()
-		request_failed.emit("HTTP %d: %s%s" % [_stream_bad_code, body, _effort_hint(body)])
+		request_failed.emit("HTTP %d: %s%s" % [_stream_bad_code, body, _failure_hints(body)])
 	elif not _stream_done and _stream_content == "" and _stream_tool_calls.is_empty():
 		# The stream ended before anything usable arrived — a failure, not an empty reply — and the three ways that happens point at different levers, so name the one that applies.
 		if _stream_est_out_chars > 0:
@@ -503,6 +544,27 @@ func _effort_hint(provider_message: String) -> String:
 	var lowered := provider_message.to_lower()
 	if lowered.contains("effort") or lowered.contains("reasoning") or lowered.contains("think"):
 		return " (This request sent reasoning effort \"%s\"; if this model doesn't accept that level, adjust its levels in the Effort Configuration dialog — the ⚡ beside the model picker.)" % effort
+	return ""
+
+
+## Every hint this client appends to a failed request's report, joined. The Responses hint stands alone when it fires on a Responses source: on the summaries-verification 400 the effort hint would name the wrong lever — the level is fine, the summary ask riding beside it is what the API rejected — and two contradictory instructions guide to no solution at all.
+func _failure_hints(provider_message: String) -> String:
+	var responses := _responses_api_hint(provider_message)
+	if responses != "" and adapter_kind != GDLLMSources.KIND_OPENAI:
+		return responses
+	return _effort_hint(provider_message) + responses
+
+
+## The Responses-API guidance for a failed request, when the provider's message points at a lever this plugin has: a chat-completions 400 naming v1/responses (OpenAI's newest models reject reasoning effort with tools on the older API — the fix is this source's Kind, one dropdown away, same URL and key; OpenAI spells the endpoint both with and without the leading slash, so the match takes the bare form) or a Responses 400 demanding organization verification for reasoning summaries (the fix is verifying, or the summaries switch in Editor Settings).
+func _responses_api_hint(provider_message: String) -> String:
+	if adapter_kind == GDLLMSources.KIND_OPENAI:
+		if provider_message.to_lower().contains("v1/responses"):
+			return " (This model wants OpenAI's newer Responses API: switch this source's Kind to \"OpenAI Responses API\" in the Connections dialog — the ⚙ beside the model picker. The URL and key stay the same.)"
+	elif adapter_kind == GDLLMSources.KIND_OPENAI_RESPONSES or adapter_kind == GDLLMSources.KIND_OPENAI_CHATGPT:
+		# The subscription kind inherits the same summary ask, so its rejections deserve the same guidance.
+		var lowered := provider_message.to_lower()
+		if lowered.contains("verified") and lowered.contains("summar"):
+			return " (Reasoning summaries are requested alongside each effort level by default. Either verify your organization with OpenAI, or turn off \"Openai Reasoning Summaries\" under gdllm/network in Editor Settings — the model still reasons at the selected effort, without the visible trace.)"
 	return ""
 
 
@@ -612,6 +674,8 @@ func _post(path: String, payload: String) -> void:
 		push_warning("LLMClient busy; ignoring request")
 		request_failed.emit("Client busy: a request is already in flight, so this one was not sent.")
 		return
+	if not await _adopt_fresh_subscription_token():
+		return
 	_busy = true
 	_completion_est_in = estimate_tokens(payload.length())
 	var adapter := _make_adapter()
@@ -632,6 +696,14 @@ func _on_request_completed(result: int, response_code: int, _headers: PackedStri
 	var text := body.get_string_from_utf8()
 	var json := JSON.new()
 	if json.parse(text) != OK:
+		# A backend that only streams (the ChatGPT subscription's) answers a one-shot completion with a buffered SSE transcript; its adapter can lift the reply out of that before the shape is declared a failure.
+		var recovered := _make_adapter().parse_completion_stream(text)
+		if not recovered.is_empty():
+			var recovered_stats: Dictionary = recovered.get("stats", {})
+			recovered_stats["est_tokens_in"] = _completion_est_in
+			recovered_stats["est_tokens_out"] = estimate_tokens(String(recovered.get("text", "")).length())
+			response_received.emit(String(recovered.get("text", "")), recovered_stats)
+			return
 		request_failed.emit(_completion_parse_failure(api_base, text))
 		return
 	# Same reported-first shape as _stream_final_stats — the body's usage plus the client's own payload estimates — so a background chore's panel can render the footer a chat turn gets.

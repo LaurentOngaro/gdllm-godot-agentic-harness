@@ -75,6 +75,9 @@ const COMPACTION_DEBUG := "gdllm/compaction/enable_debugging_tools"
 ## Debug-only: a token threshold the compaction trigger uses in place of the model's context window (0 = off), so compaction can be exercised against an arbitrarily small window.
 const COMPACTION_DEBUG_THRESHOLD := "gdllm/compaction/debug_enforce_arbitrary_compaction_threshold"
 
+## Whether an OpenAI Responses request with a selected effort level also asks for the reasoning summary trace (reasoning.summary "auto"), so the model's thinking shows in the log. OpenAI requires organization verification for summaries; an unverified org turns this off instead of losing reasoning altogether.
+const OPENAI_REASONING_SUMMARIES := "gdllm/network/openai_reasoning_summaries"
+
 const DEFAULT_MODEL := "nemotron-3-nano:30b"
 const DEFAULT_TIME_FORMAT := "12-hour"
 const DEFAULT_AUTO_EXPAND_THINKING := true
@@ -82,6 +85,7 @@ const DEFAULT_AUTO_EXPAND_TOOL_CALLS := false
 const DEFAULT_AUTO_EXPAND_TOOL_RESULTS := false
 const DEFAULT_CONDENSED_FEED := true
 const DEFAULT_MARKDOWN_RESPONSES := true
+const DEFAULT_OPENAI_REASONING_SUMMARIES := true
 const DEFAULT_MAX_PARALLEL_SUBAGENTS := 4
 const DEFAULT_NEW_SESSION_EDITS := false
 const DEFAULT_NEW_SESSION_DELETE := false
@@ -125,12 +129,14 @@ static func register() -> void:
 	var es := EditorInterface.get_editor_settings()
 	# Seed the multi-source list on first run; every template starts disabled (see GDLLMSources.default_sources).
 	GDLLMSources.ensure_seeded()
-	# An install seeded before the Anthropic kind existed gets its template row appended once, so the Connections dialog shows it without a hand-added source (deleting it sticks; see GDLLMSources.TEMPLATES_SEEDED_KEY).
-	GDLLMSources.ensure_anthropic_template()
+	# An install seeded before a newer kind existed gets that template row appended once, so the Connections dialog shows it without a hand-added source (deleting one sticks; see GDLLMSources.TEMPLATES_SEEDED_KEY).
+	GDLLMSources.ensure_templates()
 	# Render the raw sources JSON as a multi-line text box, labeled "Sources Fallback" (the Connections dialog is the primary editor; this is the readable fallback). ensure_seeded already set the value, so _define only adds the multiline property info.
 	_define(es, GDLLMSources.SETTINGS_KEY, JSON.stringify(GDLLMSources.default_sources()), PROPERTY_HINT_MULTILINE_TEXT)
 	# Same fallback pattern for the per-model effort-level and cache-TTL map (the Effort Configuration dialog is the primary editor; see GDLLMEfforts).
 	_define(es, GDLLMEfforts.SETTINGS_KEY, "{}", PROPERTY_HINT_MULTILINE_TEXT)
+	# And for each model's last-picked effort level, which new sessions on the model open with (the effort picker is the primary editor; see GDLLMEfforts.remember_level).
+	_define(es, GDLLMEfforts.SELECTION_KEY, "{}", PROPERTY_HINT_MULTILINE_TEXT)
 	# And for the ordered favorite-models list (the Favorite Models dialog is the primary editor; see GDLLMFavorites).
 	_define(es, GDLLMFavorites.SETTINGS_KEY, "[]", PROPERTY_HINT_MULTILINE_TEXT)
 	# Model settings now hold a qualified "source::model" id; default to the local source's default model.
@@ -168,6 +174,7 @@ static func register() -> void:
 	# Applies only to models without their own cache-TTL figure in the Effort Configuration dialog; or_greater admits providers with hour-long caches.
 	_define_int(es, CACHE_TTL_FALLBACK, DEFAULT_CACHE_TTL_FALLBACK, "0,3600,10,or_greater")
 	_define_bool(es, COMPACTION_DEBUG, DEFAULT_COMPACTION_DEBUG)
+	_define_bool(es, OPENAI_REASONING_SUMMARIES, DEFAULT_OPENAI_REASONING_SUMMARIES)
 	# A plain editable number line rather than a range spinbox: any window-sized figure is legitimate, and 0 keeps the override off.
 	_define_int_plain(es, COMPACTION_DEBUG_THRESHOLD, DEFAULT_COMPACTION_DEBUG_THRESHOLD)
 	# The chat log's palette, defined straight off GDLLMColors' map so a new color role is one entry there and nothing here.
@@ -355,6 +362,24 @@ static func is_condensed_feed() -> bool:
 ## Whether model replies may render as Markdown; the MarkdownLabel addon must also be installed (GDLLMMarkdown.enabled combines the two).
 static func is_markdown_responses_enabled() -> bool:
 	return bool(EditorInterface.get_editor_settings().get_setting(MARKDOWN_RESPONSES))
+
+
+## A settings key's JSON-object value as a Dictionary, {} when unset or unparseable — the one read behind every JSON-map setting (the effort maps, the ChatGPT token store). Headless runs answer {}, keeping every accessor on the test suites' paths off EditorSettings.
+static func stored_map(key: String) -> Dictionary:
+	if not Engine.is_editor_hint():
+		return {}
+	var es := EditorInterface.get_editor_settings()
+	if not es.has_setting(key):
+		return {}
+	var parsed: Variant = JSON.parse_string(String(es.get_setting(key)))
+	return parsed if parsed is Dictionary else {}
+
+
+## Whether OpenAI Responses requests ask for the reasoning summary trace beside a selected effort level (see OPENAI_REASONING_SUMMARIES). Guarded for headless runs — a --script suite has no editor settings to read, so the adapter tests see the shipped default (the GDLLMEfforts.get_config precedent).
+static func is_openai_reasoning_summaries_enabled() -> bool:
+	if not Engine.is_editor_hint():
+		return DEFAULT_OPENAI_REASONING_SUMMARIES
+	return bool(EditorInterface.get_editor_settings().get_setting(OPENAI_REASONING_SUMMARIES))
 
 
 ## Persist the auto-expand-thinking preference. The single write path both the session header's switch and the settings-dialog checkbox resolve to — writing it emits EditorSettings.settings_changed, which is how the two displays stay in sync.

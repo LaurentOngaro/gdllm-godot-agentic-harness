@@ -3,18 +3,22 @@ class_name LLMAdapter extends RefCounted
 ## Translates between the plugin's canonical (Ollama-native) message/tool shape and one provider's wire format.
 ## LLMClient owns the transport (socket, HTTP state machine); an adapter only says which path to hit, how to build a request body, and how to turn a streamed line back into canonical events.
 ## A fresh instance is built per request so a stateful format (OpenAI's tool-call argument fragments) can accumulate across lines.
-## Subclasses: OllamaAdapter (near-identity — the canonical shape already IS Ollama's), OpenAIAdapter and AnthropicAdapter (translate at both edges).
+## Subclasses: OllamaAdapter (near-identity — the canonical shape already IS Ollama's), OpenAIAdapter, OpenAIResponsesAdapter (OpenAI's newer /v1/responses format, which its GPT-5.6-class models require for reasoning effort with tools), and AnthropicAdapter (translate at both edges).
 ##
-## Canonical stream events an adapter emits from parse_line, folded straight onto LLMClient's state: {type:"thinking", text}, {type:"content", text}, {type:"tool_calls", calls}, {type:"done", stats, stop}, {type:"error", message}.
+## Canonical stream events an adapter emits from parse_line, folded straight onto LLMClient's state: {type:"thinking", text}, {type:"content", text}, {type:"tool_calls", calls}, {type:"done", stats, stop}, {type:"error", message} — plus {type:"progress"}, a no-op for a recognized frame with nothing streamable yet, so the client's wire-format guard knows the reply parses before the first visible delta (a Responses reasoning turn can stream nothing user-visible for minutes).
 ## A done event's `stop` is the provider's end-of-turn reason canonicalized by _canonical_stop: "" for a normal finish, "length" for the output-token cap, anything else verbatim — so a reply the provider itself cut short is never presented as finished (see LLMClient._stream_final_stats).
 ## A canonical tool call is {"function": {name, arguments: Dictionary}} — exactly what GDLLMTools.tool_call_name/args/sanitize_tool_calls consume.
-## An adapter whose provider must see its own turn echoed verbatim to continue a tool loop (Anthropic) additionally emits {type:"assistant_blocks", blocks} ahead of the tool calls; LLMClient holds the blocks for the caller to store beside the turn (see LLMClient.last_assistant_blocks).
+## An adapter whose provider must see its own turn echoed verbatim to continue a tool loop (Anthropic, the OpenAI Responses API) additionally emits {type:"assistant_blocks", blocks} ahead of the tool calls; LLMClient holds the blocks for the caller to store beside the turn (see LLMClient.last_assistant_blocks).
 
 
 ## Build the adapter for a source `kind` (see GDLLMSources.KIND_*). Unknown kinds fall back to Ollama.
 static func for_kind(kind: String) -> LLMAdapter:
 	if kind == GDLLMSources.KIND_OPENAI:
 		return OpenAIAdapter.new()
+	if kind == GDLLMSources.KIND_OPENAI_RESPONSES:
+		return OpenAIResponsesAdapter.new()
+	if kind == GDLLMSources.KIND_OPENAI_CHATGPT:
+		return OpenAIChatGPTAdapter.new()
 	if kind == GDLLMSources.KIND_ANTHROPIC:
 		return AnthropicAdapter.new()
 	return OllamaAdapter.new()
@@ -25,7 +29,7 @@ func chat_path() -> String:
 	return ""
 
 
-## The JSON-ready body for a streamed chat turn, built from canonical `messages` (a leading system message included) and function-schema `tools`. `effort` is the user's reasoning-effort level (a GDLLMEfforts.LEVELS name; "" = default, meaning no knob is sent), which each adapter translates to its provider's own control: Ollama's `think`, OpenAI's `reasoning_effort`, Anthropic's `output_config.effort` (or disabled thinking for "none"). A level the provider or model doesn't accept fails loudly at request time — which is why the user-maintained config gates what's offered (see GDLLMEfforts). `cache_ttl` is the session's effective prompt-cache TTL in seconds (see GDLLMChatSession._cache_cold_gap_seconds); Anthropic is the only provider whose cache takes a requested lifetime, so the other adapters ignore it.
+## The JSON-ready body for a streamed chat turn, built from canonical `messages` (a leading system message included) and function-schema `tools`. `effort` is the user's reasoning-effort level (a GDLLMEfforts.LEVELS name; "" = default, meaning no knob is sent), which each adapter translates to its provider's own control: Ollama's `think`, OpenAI's `reasoning_effort` (`reasoning.effort` on the Responses API), Anthropic's `output_config.effort` (or disabled thinking for "none"). A level the provider or model doesn't accept fails loudly at request time — which is why the user-maintained config gates what's offered (see GDLLMEfforts). `cache_ttl` is the session's effective prompt-cache TTL in seconds (see GDLLMChatSession._cache_cold_gap_seconds); Anthropic is the only provider whose cache takes a requested lifetime, so the other adapters ignore it.
 func build_chat_body(_model: String, _messages: Array, _tools: Array, _effort: String = "", _cache_ttl: int = 0) -> Dictionary:
 	return {}
 
@@ -38,6 +42,11 @@ func parse_line(_line: String) -> Array:
 ## The request path for the model-list fetch.
 func models_path() -> String:
 	return ""
+
+
+## The model names this source serves without asking the network, for a backend that publishes no listing endpoint (the ChatGPT subscription backend); empty means fetch models_path and parse the reply.
+func static_models() -> PackedStringArray:
+	return PackedStringArray()
 
 
 ## Model names out of a parsed model-list response body.
@@ -67,6 +76,11 @@ func parse_completion(_data: Variant) -> String:
 
 ## The usage counters out of a parsed completion response body, mapped onto the plugin's stat keys; {} when the body carries none.
 func parse_completion_stats(_data: Variant) -> Dictionary:
+	return {}
+
+
+## The reply lifted out of a one-shot completion whose body arrived as a buffered SSE transcript instead of JSON — {text, stats} when the transcript parsed, {} otherwise. Only a backend that refuses non-streamed requests needs this (the ChatGPT subscription's); everywhere else the JSON path answers first and this is never consulted.
+func parse_completion_stream(_text: String) -> Dictionary:
 	return {}
 
 
@@ -109,6 +123,52 @@ static func _text(v: Variant) -> String:
 	if v == null:
 		return ""
 	return str(v)
+
+
+## An error frame's user-facing message: `message` prefixed with the provider's error kind/code when it adds information ("overloaded_error: Overloaded" — skipped when the message already names it), falling back to `fallback` (typically the raw frame) when both are empty, so an error is never reported blank.
+static func _prefixed_error(kind: String, message: String, fallback: String) -> String:
+	var out := message
+	if kind != "" and not out.contains(kind):
+		out = ("%s: %s" % [kind, out]) if out != "" else kind
+	return out if out != "" else fallback
+
+
+## The leading system messages' text, joined — for the providers that carry the system prompt as a top-level request field (Anthropic's `system`, the Responses API's `instructions`) rather than a message role.
+func _system_text(messages: Array) -> String:
+	var parts: Array = []
+	for msg in messages:
+		if msg is Dictionary and String(msg.get("role", "")) == "system":
+			var text := _text(msg.get("content"))
+			if text.strip_edges() != "":
+				parts.append(text)
+	return "\n\n".join(parts)
+
+
+## One assistant tool-call turn as plain text — its preamble plus a "[called name(args)]" line per call — for tool-less requests on providers that reject tool blocks/items they didn't declare (see each echoing adapter's translate).
+func _flatten_call_text(msg: Dictionary) -> String:
+	var lines: Array = []
+	var text := _text(msg.get("content"))
+	if text.strip_edges() != "":
+		lines.append(text)
+	for tc in msg["tool_calls"]:
+		var fn: Dictionary = tc["function"] if tc is Dictionary and tc.get("function") is Dictionary else {}
+		lines.append("[called %s(%s)]" % [_text(fn.get("name")), JSON.stringify(fn.get("arguments", {}))])
+	return "\n".join(lines)
+
+
+## One tool result as a labeled plain-text user line ("[name result]…"), the flatten counterpart to _flatten_call_text for the same tool-less requests.
+static func _flatten_tool_result_text(msg: Dictionary) -> String:
+	var text := _text(msg.get("content"))
+	return "[%s result]\n%s" % [_text(msg.get("tool_name", "tool")), text if text.strip_edges() != "" else "(no output)"]
+
+
+## The index of the last user message in canonical history — the trailing tool loop's boundary: turns after it may replay their stored provider echo, earlier ones rebuild from text (see each echoing adapter's translate). -1 (no user message) makes the whole span that loop. Mirrors GDLLMChatSession._echo_boundary.
+static func _last_user_index(messages: Array) -> int:
+	var last_user := -1
+	for i in messages.size():
+		if messages[i] is Dictionary and String(messages[i].get("role", "")) == "user":
+			last_user = i
+	return last_user
 
 
 ## Native Ollama: /api/chat NDJSON, /api/tags, /api/generate. The canonical shapes are already Ollama's, so building and parsing are near pass-throughs.
@@ -266,14 +326,22 @@ class OpenAIAdapter extends LLMAdapter:
 	func models_path() -> String:
 		return "/models"
 
-	## A pasted full endpoint (the URL an OpenAI-compatible server's UI hands out, e.g. LM Studio's …/v1/chat/completions) reduces to its serving base first. Then a pathless base (e.g. "http://localhost:8000" for a local vLLM) gets "/v1" appended, since every OpenAI-compatible server serves under it; a base that still carries a path (Poolside's "/v1", a gateway's custom prefix) is respected as-is.
+	## A pasted full endpoint (the URL an OpenAI-compatible server's UI hands out, e.g. LM Studio's …/v1/chat/completions) reduces to its serving base first. Then a pathless base (e.g. "http://localhost:8000" for a local vLLM) gets the kind's default path appended (see _default_path); a base that still carries a path (Poolside's "/v1", a gateway's custom prefix) is respected as-is.
 	func normalize_base(base: String) -> String:
-		var out := _root_from_endpoint(super.normalize_base(base), ["/chat/completions", "/completions", "/models", "/embeddings"])
+		var out := _root_from_endpoint(super.normalize_base(base), _endpoint_suffixes())
 		var scheme_end := out.find("://")
 		var host_start := scheme_end + 3 if scheme_end != -1 else 0
 		if out.find("/", host_start) == -1 and out != "":
-			out += "/v1"
+			out += _default_path()
 		return out
+
+	## The pasted-endpoint suffixes normalize_base strips back to the serving base, most-specific first; subclasses swap in their own chat path.
+	func _endpoint_suffixes() -> Array:
+		return ["/chat/completions", "/completions", "/models", "/embeddings"]
+
+	## The serving path a pathless base gains: every OpenAI-compatible server serves under /v1; the ChatGPT subclass swaps in its backend prefix.
+	func _default_path() -> String:
+		return "/v1"
 
 	func parse_models(data: Variant) -> PackedStringArray:
 		var names := PackedStringArray()
@@ -452,6 +520,298 @@ class OpenAIAdapter extends LLMAdapter:
 		}
 
 
+## OpenAI Responses API: /v1/responses SSE, /v1/models — OpenAI's newer wire format, which its GPT-5.6-class models require to combine reasoning effort with function tools (/v1/chat/completions rejects that pairing on them, naming this endpoint as the fix; every older OpenAI model also serves under /v1/responses, so one source kind covers the whole catalog).
+## Extends OpenAIAdapter for what the two formats share — auth, the /v1/models list and its window probe, the /v1 base handling — and overrides the chat/completion paths and both translation edges: canonical history becomes Responses input items on send (the system prompt as top-level instructions, tool results as function_call_output items), and the semantic SSE events reassemble into canonical events on receive.
+## Every request sends store:false — the plugin's own history stays the only record, nothing accumulates server-side — with reasoning items riding back encrypted (encrypted_content), so a tool loop continues statelessly: the API requires every output item between the last user message and a function_call_output echoed back untouched (dropping one 400s naming the missing item), so a tool-call turn's raw items are handed back via the assistant_blocks event and replayed verbatim inside the trailing loop — the same echo mechanism AnthropicAdapter uses.
+class OpenAIResponsesAdapter extends OpenAIAdapter:
+	var _items: Array = [] ## Finalized output items in stream order (reasoning, message, function_call — from response.output_item.done), replayed for the tool-loop echo; the terminal frame's authoritative output list replaces the accumulation when it arrives (see _adopt_response).
+	var _summary_item: String = "" ## The reasoning item whose summary parts are currently streaming; a change marks an item boundary needing its own paragraph break (see the summary_part arm).
+
+	func chat_path() -> String:
+		return "/responses"
+
+	func build_chat_body(model: String, messages: Array, tools: Array, effort: String = "", _cache_ttl: int = 0) -> Dictionary:
+		var body := {
+			"model": model,
+			"input": _translate_input(messages, not tools.is_empty()),
+			"stream": true,
+			# store:false keeps this plugin's history the only record; reasoning then rides back encrypted for the stateless echo (see the class doc). The include is the legacy spelling — current servers attach encrypted_content on store:false by themselves, and the explicit ask keeps older gateways working.
+			"store": false,
+			"include": ["reasoning.encrypted_content"],
+		}
+		var instructions := _system_text(messages)
+		if instructions != "":
+			body["instructions"] = instructions
+		# The knob is reasoning.effort, and its value set is the level vocabulary itself ("none" included; "minimal" died with the GPT-5.0 generation — the user-maintained level config gates what each model is offered, see GDLLMEfforts). A selected level also asks for the reasoning summary trace so the thinking shows in the log — except where none can exist ("none"/"minimal") or the user turned the ask off (OpenAI gates summaries behind organization verification; see GDLLMSettings.OPENAI_REASONING_SUMMARIES).
+		if effort != "":
+			var reasoning := {"effort": effort}
+			if effort != "none" and effort != "minimal" and GDLLMSettings.is_openai_reasoning_summaries_enabled():
+				reasoning["summary"] = "auto"
+			body["reasoning"] = reasoning
+		if not tools.is_empty():
+			body["tools"] = _translate_tools(tools)
+		return body
+
+	## The canonical function-schema envelope flattened to the Responses tool shape — the same fields minus the nesting ({type, name, description, parameters}); chat/completions keeps them under a "function" wrapper, this API doesn't.
+	func _translate_tools(tools: Array) -> Array:
+		var out: Array = []
+		for entry in tools:
+			var fn: Dictionary = entry["function"] if entry is Dictionary and entry.get("function") is Dictionary else {}
+			if fn.is_empty():
+				continue
+			var schema: Variant = fn.get("parameters")
+			out.append({
+				"type": "function",
+				"name": _text(fn.get("name")),
+				"description": _text(fn.get("description")),
+				"parameters": schema if schema is Dictionary and not schema.is_empty() else {"type": "object", "properties": {}},
+			})
+		return out
+
+	## Canonical history translated to Responses input items. An assistant tool-call turn inside the trailing tool loop (everything after the last real user message) echoes its stored raw output items verbatim — reasoning items, encrypted content intact — because the API validates every item between the last user message and a function_call_output (see the class doc); earlier turns rebuild from text + synthesized call ids so past reasoning isn't re-sent (goal 1), which the API accepts for completed turns. Each tool result becomes a function_call_output bound to its call id by order. With `allow_tool_items` false — a tool-less request such as the loop-brake reflection or a subagent's forced final answer — the loop's turns flatten to plain text instead, so a request that declares no tools can't trip over tool items it never announced.
+	func _translate_input(messages: Array, allow_tool_items: bool) -> Array:
+		var last_user := _last_user_index(messages)
+		var out: Array = []
+		var pending_ids: Array = [] # call_ids of the last assistant turn's calls, awaiting their tool results in order
+		for i in messages.size():
+			var msg: Variant = messages[i]
+			if not (msg is Dictionary):
+				continue
+			var role := String(msg.get("role", ""))
+			if role == "system":
+				continue # lifted to the top-level instructions field by build_chat_body
+			if role == "tool":
+				var result_text := _text(msg.get("content"))
+				if allow_tool_items:
+					out.append({"type": "function_call_output", "call_id": _text(pending_ids.pop_front()) if not pending_ids.is_empty() else "", "output": result_text if result_text.strip_edges() != "" else "(no output)"})
+				else:
+					out.append({"role": "user", "content": _flatten_tool_result_text(msg)})
+			elif role == "assistant" and msg.get("tool_calls") is Array and not msg["tool_calls"].is_empty():
+				if allow_tool_items:
+					pending_ids = []
+					out.append_array(_assistant_call_items(msg, i > last_user, pending_ids, i))
+				else:
+					out.append(_assistant_text_item(_flatten_call_text(msg)))
+			elif role == "assistant":
+				out.append(_assistant_text_item(_text(msg.get("content"))))
+			else:
+				var user_text := _text(msg.get("content"))
+				# The API rejects empty text content, and history can hold a blank echo.
+				out.append({"role": role, "content": user_text if user_text.strip_edges() != "" else "(empty)"})
+		return out
+
+	## One assistant text turn as an input item. Echoed assistant text must be an output_text part — the input_text spelling is rejected on the assistant role.
+	static func _assistant_text_item(text: String) -> Dictionary:
+		return {"role": "assistant", "content": [{"type": "output_text", "text": text if text.strip_edges() != "" else "(empty)"}]}
+
+	## The input items for one assistant tool-call turn. Inside the trailing loop (`use_raw`), the stored raw output items replay verbatim and their real call_ids fill `pending_ids`; otherwise the turn rebuilds from its text and calls with synthesized ids ("call_gdllm_<turn>_<n>"), which the API accepts for completed turns as long as each function_call_output echoes the same id back. Raw items carrying no function_call at all were recorded under another kind (the source's Kind switched mid-loop; Anthropic stores tool_use/thinking blocks in the same field) — replaying those verbatim 400s on alien item types, so they fall through to the rebuild, which always speaks this wire format.
+	func _assistant_call_items(msg: Dictionary, use_raw: bool, pending_ids: Array, turn_index: int) -> Array:
+		var raw: Variant = msg.get("assistant_blocks")
+		if use_raw and raw is Array and not raw.is_empty():
+			for item in raw:
+				if item is Dictionary and String(item.get("type", "")) == "function_call":
+					pending_ids.append(_text(item.get("call_id")))
+			if not pending_ids.is_empty():
+				return raw
+		var items: Array = []
+		var text := _text(msg.get("content"))
+		if text.strip_edges() != "":
+			items.append(_assistant_text_item(text))
+		var n := 0
+		for tc in msg["tool_calls"]:
+			var fn: Dictionary = tc["function"] if tc is Dictionary and tc.get("function") is Dictionary else {}
+			var raw_args: Variant = fn.get("arguments", {})
+			var call_id := "call_gdllm_%d_%d" % [turn_index, n]
+			n += 1
+			pending_ids.append(call_id)
+			items.append({"type": "function_call", "call_id": call_id, "name": _text(fn.get("name")), "arguments": raw_args if raw_args is String else JSON.stringify(raw_args)})
+		return items
+
+	func parse_line(line: String) -> Array:
+		var trimmed := line.strip_edges()
+		# SSE frames are "event: name" + "data: {json}" pairs; the data's own `type` field repeats the event name, so only data lines matter (this API sends no [DONE] sentinel — a terminal response.* frame ends the stream).
+		if not trimmed.begins_with("data:"):
+			return []
+		var json := JSON.new()
+		if json.parse(trimmed.substr(5).strip_edges()) != OK:
+			return []
+		var data: Variant = json.get_data()
+		if not (data is Dictionary):
+			return []
+		var type := String(data.get("type", ""))
+		# A proxy in front of a Responses endpoint (LiteLLM and friends) reports a mid-stream failure as a typeless {"error": {...}} frame — the shape the chat-completions adapter handles; dropping it would hide the provider's real complaint behind a wire-format attribution.
+		if type == "" and data.has("error"):
+			var err: Variant = data["error"]
+			var message := _text(err.get("message", "")) if err is Dictionary else _text(err)
+			return [{"type": "error", "message": message if message != "" else trimmed}]
+		match type:
+			"response.output_text.delta":
+				var content := _text(data.get("delta"))
+				if content != "":
+					return [{"type": "content", "text": content}]
+			"response.reasoning_summary_text.delta", "response.reasoning_text.delta":
+				# Hosted models expose reasoning as summary deltas (requested in build_chat_body); raw reasoning_text arrives only from open-weight serving stacks.
+				var thinking := _text(data.get("delta"))
+				if thinking != "":
+					return [{"type": "thinking", "text": thinking}]
+			"response.reasoning_summary_part.added":
+				# Parts are separate paragraphs whose deltas carry no separator of their own; break between them or consecutive summaries render glued into one run-on line. summary_index restarts per reasoning item (a multi-tool turn can carry several), so a new item's first part breaks too.
+				var item_id := _text(data.get("item_id"))
+				var new_item := item_id != _summary_item and _summary_item != ""
+				_summary_item = item_id
+				if int(data.get("summary_index", 0)) > 0 or new_item:
+					return [{"type": "thinking", "text": "\n\n"}]
+			"response.refusal.done":
+				# A refusal replaces the message's output_text, so without this arm the turn would end as a clean empty reply; latching _finished keeps the trailing response.completed from dressing it up as a finished turn.
+				_finished = true
+				var refusal := _text(data.get("refusal"))
+				return [{"type": "error", "message": "OpenAI declined this request (refusal)." if refusal == "" else "OpenAI declined this request (refusal): %s" % refusal}]
+			"response.output_item.done":
+				if data.get("item") is Dictionary:
+					_items.append(data["item"])
+			"response.completed":
+				_adopt_response(data)
+				return _finish_events()
+			"response.incomplete":
+				_adopt_response(data)
+				var resp: Dictionary = data["response"] if data.get("response") is Dictionary else {}
+				var details: Dictionary = resp["incomplete_details"] if resp.get("incomplete_details") is Dictionary else {}
+				var reason := _text(details.get("reason"))
+				# "max_output_tokens" canonicalizes to "length" so a capped reply is disclosed, not shown as finished; any other reason ("content_filter") passes verbatim.
+				return _finish_events("length" if reason == "max_output_tokens" else (reason if reason != "" else "incomplete"))
+			"response.failed":
+				var resp: Dictionary = data["response"] if data.get("response") is Dictionary else {}
+				var err: Dictionary = resp["error"] if resp.get("error") is Dictionary else {}
+				return [{"type": "error", "message": _prefixed_error(_text(err.get("code", "")), _text(err.get("message", "")), trimmed)}]
+			"error":
+				# The stream-level error frame carries code/message at top level, unlike response.failed's embedded shape.
+				return [{"type": "error", "message": _prefixed_error(_text(data.get("code", "")), _text(data.get("message", "")), trimmed)}]
+		# Every other recognized lifecycle frame (response.created, output_item.added, content_part.added, …) is proof the reply speaks this wire format — a reasoning turn can stream nothing user-visible for minutes, and the client's format guard must not read that silence as an unrecognized reply, even behind a proxy that drops individual frames (see LLMClient._stream_saw_event).
+		return [{"type": "progress"}] if type.begins_with("response.") else []
+
+	## Fold a terminal frame's embedded response snapshot into state: its usage (the only place this API reports the counters — there is no include_usage concept here) and its authoritative output list, which replaces the per-item accumulation when present so the echo is exactly what the server finalized.
+	func _adopt_response(data: Dictionary) -> void:
+		var resp: Dictionary = data["response"] if data.get("response") is Dictionary else {}
+		if resp.get("usage") is Dictionary:
+			_usage = resp["usage"]
+		if resp.get("output") is Array and not resp["output"].is_empty():
+			_items = resp["output"]
+
+	## The terminal events for the stream: the raw output items for the tool-loop echo, the assembled tool calls, then done+stats — emitted at most once (`stop` arrives pre-canonicalized from parse_line; "" is a normal finish). The signature keeps the parent's zero-argument form callable — GDScript requires override compatibility — and an inherited bare call reads as a normal finish.
+	func _finish_events(stop: String = "") -> Array:
+		if _finished:
+			return []
+		_finished = true
+		var events: Array = []
+		var calls: Array = []
+		for item in _items:
+			if item is Dictionary and String(item.get("type", "")) == "function_call":
+				# Arguments arrive as a JSON string; a no-argument call's empty string parses as {} rather than a noisy failure.
+				var args_text := _text(item.get("arguments"))
+				var parsed: Variant = JSON.parse_string(args_text) if args_text != "" else {}
+				calls.append({"function": {"name": _text(item.get("name")), "arguments": parsed if parsed is Dictionary else {}}})
+		if not calls.is_empty():
+			# The raw items ride ahead of the calls so LLMClient holds them before the tool_calls signal fires (see last_assistant_blocks).
+			events.append({"type": "assistant_blocks", "blocks": _items})
+			events.append({"type": "tool_calls", "calls": calls})
+		events.append({"type": "done", "stats": _responses_stats(_usage), "stop": stop})
+		return events
+
+	func completion_request(model: String, system_prompt: String, prompt: String) -> Dictionary:
+		# input as an explicit one-item list, never the documented string shorthand: api.openai.com accepts both, but the ChatGPT subscription backend (which inherits this) rejects the shorthand with "Input must be a list". store:false for the same statelessness as the chat path.
+		var body := {"model": model, "input": [{"role": "user", "content": prompt}], "store": false}
+		if system_prompt != "":
+			body["instructions"] = system_prompt
+		return {"path": "/responses", "body": body}
+
+	## The reply text out of a parsed (non-streamed) response body: the first output_text part of the first message item — reasoning items precede it on thinking models.
+	func parse_completion(data: Variant) -> String:
+		if data is Dictionary and data.get("output") is Array:
+			for item in data["output"]:
+				if item is Dictionary and String(item.get("type", "")) == "message" and item.get("content") is Array:
+					for part in item["content"]:
+						if part is Dictionary and String(part.get("type", "")) == "output_text":
+							return _text(part.get("text"))
+		return ""
+
+	func parse_completion_stats(data: Variant) -> Dictionary:
+		if data is Dictionary and data.get("usage") is Dictionary:
+			return _responses_stats(data["usage"])
+		return {}
+
+	## This API's usage counters mapped onto the plugin's stat keys — the field names differ from chat/completions (input_tokens/output_tokens, not prompt_/completion_); no durations are reported, so those stay 0. Static so the non-streamed completion path maps through the same rule.
+	static func _responses_stats(usage: Dictionary) -> Dictionary:
+		return {
+			"tokens_in": int(usage.get("input_tokens", 0)),
+			"tokens_out": int(usage.get("output_tokens", 0)),
+			"prompt_eval_duration": 0,
+			"eval_duration": 0,
+			"total_duration": 0,
+		}
+
+	## The parent's suffix list plus this API's own chat path, so a pasted …/v1/responses endpoint reduces to its /v1 base the same way.
+	func _endpoint_suffixes() -> Array:
+		return super._endpoint_suffixes() + ["/responses"]
+
+
+## OpenAI ChatGPT Subscription: the parent's Responses wire format, served from the ChatGPT backend and authenticated with the user's ChatGPT sign-in (OAuth access tokens; see GDLLMOAuth) instead of an API key — how a Plus/Pro subscription drives the harness without API billing.
+## Only auth and discovery differ from the parent: the Bearer token is a ChatGPT access token whose own account-id claim must ride back as a header (read straight from the token, so no side channel is needed), and the backend publishes no model list or window probe — the model set is a maintained constant, and context windows come from the Effort Configuration dialog alone.
+class OpenAIChatGPTAdapter extends OpenAIResponsesAdapter:
+	const ORIGINATOR := "gdllm" ## The client identifier sent with each request, naming this harness honestly.
+	## The models the subscription backend serves, maintained by hand — there is no listing endpoint to sweep. An id the backend no longer takes fails loudly at request time, naming the model. Verified against the Codex model docs 2026-08-12; ids on their announced retirement path (gpt-5.4 and gpt-5.4-mini retire 2026-08-31) are deliberately not listed.
+	const MODELS: Array[String] = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.3-codex-spark", "gpt-5.5"]
+
+	## The ChatGPT access token rides as a Bearer like an API key, and the backend additionally wants the token's own chatgpt_account_id claim echoed as a header, plus the originator stamp.
+	func auth_headers(api_key: String) -> PackedStringArray:
+		var headers := super.auth_headers(api_key)
+		headers.append("originator: " + ORIGINATOR)
+		var claims := GDLLMOAuth.jwt_claims(api_key.strip_edges())
+		var auth_claim: Dictionary = claims["https://api.openai.com/auth"] if claims.get("https://api.openai.com/auth") is Dictionary else {}
+		var account := LLMAdapter._text(auth_claim.get("chatgpt_account_id"))
+		if account != "":
+			headers.append("chatgpt-account-id: " + account)
+		return headers
+
+	func static_models() -> PackedStringArray:
+		return PackedStringArray(MODELS)
+
+	## No listing endpoint exists to read a window from; the Effort Configuration dialog's declared figure is the only source (see GDLLMEfforts.context_window_for).
+	func context_probe(_model: String) -> Dictionary:
+		return {}
+
+	## The subscription backend serves only streamed responses, so the one-shot completion (session titles) asks for a stream too; HTTPRequest buffers the whole SSE transcript, which parse_completion_stream then reads at once.
+	func completion_request(model: String, system_prompt: String, prompt: String) -> Dictionary:
+		var req := super.completion_request(model, system_prompt, prompt)
+		req["body"]["stream"] = true
+		return req
+
+	## A buffered SSE transcript run through a fresh stream parse: the terminal frame's text and usage, lifted for the completion path. {} when no terminal frame parsed — the body wasn't this API's stream, and the normal failure attribution should speak.
+	func parse_completion_stream(text: String) -> Dictionary:
+		var parser := OpenAIChatGPTAdapter.new()
+		var content := ""
+		var stats := {}
+		var finished := false
+		for line in text.split("\n"):
+			for event in parser.parse_line(line):
+				match String(event.get("type", "")):
+					"content":
+						content += String(event.get("text", ""))
+					"done":
+						stats = event.get("stats", {})
+						finished = true
+		if not finished:
+			return {}
+		return {"text": content, "stats": stats}
+
+	## A pasted full …/responses endpoint reduces to the backend base; nothing else is ever pasted for this kind.
+	func _endpoint_suffixes() -> Array:
+		return ["/responses"]
+
+	## A pathless base gains the ChatGPT backend prefix, not /v1 (see OpenAIAdapter.normalize_base, which both rules ride).
+	func _default_path() -> String:
+		return "/backend-api/codex"
+
+
 ## Anthropic Messages API: /v1/messages SSE, /v1/models. Auth is x-api-key + anthropic-version, not a Bearer token.
 ## Translates the canonical shape to Anthropic's content-block format on send (the system prompt as a top-level field, tool results as tool_result blocks inside user messages) and reassembles the streamed events (thinking, text, tool_use input fragments) back into canonical events on receive.
 ## Adaptive thinking is requested only on model families documented to accept it; a selected effort level rides output_config.effort beside it ("none" becomes thinking:disabled instead — see build_chat_body), and a tool-call turn's raw content blocks are handed back via the assistant_blocks event because the API requires them echoed — thinking signatures intact — to continue a tool loop.
@@ -602,10 +962,7 @@ class AnthropicAdapter extends LLMAdapter:
 				# Like the sibling adapters, an error frame without a usable message falls back to the raw frame — a proxy's bare-string error or a type-only dict still names its real cause that way — and the error's type ("overloaded_error", "rate_limit_error") is kept, since it IS the cause for frames whose message merely elaborates.
 				var err: Dictionary = data["error"] if data.get("error") is Dictionary else {}
 				var message := _text(err.get("message", "")) if data.get("error") is Dictionary else _text(data.get("error"))
-				var err_type := _text(err.get("type", ""))
-				if err_type != "" and not message.contains(err_type):
-					message = ("%s: %s" % [err_type, message]) if message != "" else err_type
-				return [{"type": "error", "message": message if message != "" else trimmed}]
+				return [{"type": "error", "message": _prefixed_error(_text(err.get("type", "")), message, trimmed)}]
 		return []
 
 	## The thinking parameter for `model`. Adaptive thinking is requested only on families documented to accept it, so an unknown or older model never 400s on an unsupported knob; families whose default omits the trace text opt back in with display:"summarized" so the reasoning block the plugin renders isn't empty (the 4.6 family already defaults to summarized).
@@ -618,16 +975,6 @@ class AnthropicAdapter extends LLMAdapter:
 			if name.begins_with(family):
 				return {"type": "adaptive"}
 		return {}
-
-	## The leading system messages' text, joined — Anthropic takes the system prompt as a top-level field, not a message role.
-	func _system_text(messages: Array) -> String:
-		var parts: Array = []
-		for msg in messages:
-			if msg is Dictionary and String(msg.get("role", "")) == "system":
-				var text := _text(msg.get("content"))
-				if text.strip_edges() != "":
-					parts.append(text)
-		return "\n\n".join(parts)
 
 	## The canonical function-schema envelope ({type:"function", function:{name, description, parameters}}) unwrapped to Anthropic's flat tool shape.
 	func _translate_tools(tools: Array) -> Array:
@@ -646,10 +993,7 @@ class AnthropicAdapter extends LLMAdapter:
 
 	## Canonical history translated to Anthropic's content-block messages. Tool results become tool_result blocks inside user messages — consecutive results merge into one user turn, as the API requires — each bound to its call id by order. An assistant tool-call turn inside the trailing tool loop (everything after the last real user message) echoes its stored raw `assistant_blocks`, thinking signatures intact, because the API validates them to continue the loop; earlier turns rebuild from text + synthesized ids so past reasoning isn't re-sent (goal 1). With `allow_tool_blocks` false — a tool-less request such as the loop-brake reflection or a subagent's forced final answer — the API rejects tool_use/tool_result blocks outright, so the loop's turns flatten to plain text the model can still read.
 	func _translate_messages(messages: Array, allow_tool_blocks: bool) -> Array:
-		var last_user := -1
-		for i in messages.size():
-			if messages[i] is Dictionary and String(messages[i].get("role", "")) == "user":
-				last_user = i
+		var last_user := _last_user_index(messages)
 		var out: Array = []
 		var pending_ids: Array = [] # ids of the last assistant turn's tool_use blocks, awaiting their tool results in order
 		for i in messages.size():
@@ -663,8 +1007,7 @@ class AnthropicAdapter extends LLMAdapter:
 				if allow_tool_blocks:
 					_append_tool_result(out, pending_ids, _text(msg.get("content")))
 				else:
-					var result_text := _text(msg.get("content"))
-					out.append({"role": "user", "content": "[%s result]\n%s" % [_text(msg.get("tool_name", "tool")), result_text if result_text.strip_edges() != "" else "(no output)"]})
+					out.append({"role": "user", "content": _flatten_tool_result_text(msg)})
 			elif role == "assistant" and msg.get("tool_calls") is Array and not msg["tool_calls"].is_empty():
 				if allow_tool_blocks:
 					pending_ids = []
@@ -677,25 +1020,15 @@ class AnthropicAdapter extends LLMAdapter:
 				out.append({"role": role, "content": text if text.strip_edges() != "" else "(empty)"})
 		return out
 
-	## One assistant tool-call turn as plain text — its preamble plus a "[called name(args)]" line per call — for tool-less requests that cannot carry tool_use blocks.
-	func _flatten_call_text(msg: Dictionary) -> String:
-		var lines: Array = []
-		var text := _text(msg.get("content"))
-		if text.strip_edges() != "":
-			lines.append(text)
-		for tc in msg["tool_calls"]:
-			var fn: Dictionary = tc["function"] if tc is Dictionary and tc.get("function") is Dictionary else {}
-			lines.append("[called %s(%s)]" % [_text(fn.get("name")), JSON.stringify(fn.get("arguments", {}))])
-		return "\n".join(lines)
-
-	## The content blocks for one assistant tool-call turn. Inside the trailing loop (`use_raw`), the stored raw blocks are echoed verbatim and their real tool_use ids fill `pending_ids`; otherwise the turn rebuilds from its text and calls with synthesized ids ("toolu_gdllm_<turn>_<n>"), which the stateless API accepts as long as each tool_result echoes the same id back.
+	## The content blocks for one assistant tool-call turn. Inside the trailing loop (`use_raw`), the stored raw blocks are echoed verbatim and their real tool_use ids fill `pending_ids`; otherwise the turn rebuilds from its text and calls with synthesized ids ("toolu_gdllm_<turn>_<n>"), which the stateless API accepts as long as each tool_result echoes the same id back. Raw blocks carrying no tool_use at all were recorded under another kind (the source's Kind switched mid-loop; the Responses adapter stores function_call/reasoning items in the same field) — replaying those verbatim 400s on alien block types, so they fall through to the rebuild, which always speaks this wire format.
 	func _assistant_call_blocks(msg: Dictionary, use_raw: bool, pending_ids: Array, turn_index: int) -> Array:
 		var raw: Variant = msg.get("assistant_blocks")
 		if use_raw and raw is Array and not raw.is_empty():
 			for block in raw:
 				if block is Dictionary and String(block.get("type", "")) == "tool_use":
 					pending_ids.append(_text(block.get("id")))
-			return raw
+			if not pending_ids.is_empty():
+				return raw
 		var blocks: Array = []
 		var text := _text(msg.get("content"))
 		if text.strip_edges() != "":

@@ -99,7 +99,7 @@ func run(source: Dictionary, system_prompt: String, prompt: String, use_tools: b
 				_emit_stats(outcome) # after the turn's note, before its tool calls — where the main chat places a message's footer
 				# Echo the assistant tool-call turn back so the model sees its own calls, sanitized to the shape Ollama accepts on resend.
 				var echo := {"role": "assistant", "content": preamble, "tool_calls": GDLLMTools.sanitize_tool_calls(tool_calls)}
-				# A provider that must see its raw turn echoed to continue the loop (Anthropic) left its blocks on the outcome; carry them so the adapter can replay the turn verbatim (see LLMClient.last_assistant_blocks).
+				# A provider that must see its raw turn echoed to continue the loop (Anthropic, the OpenAI Responses API) left its blocks on the outcome; carry them so the adapter can replay the turn verbatim (see LLMClient.last_assistant_blocks).
 				if outcome.get("assistant_blocks") is Array and not outcome["assistant_blocks"].is_empty():
 					echo["assistant_blocks"] = outcome["assistant_blocks"]
 				messages.append(echo)
