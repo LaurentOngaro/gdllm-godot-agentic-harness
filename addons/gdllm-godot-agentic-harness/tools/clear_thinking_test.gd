@@ -1,5 +1,5 @@
 extends SceneTree
-## Headless regression tests for "Clear Thinking": clearing must strip reasoning from every place it is stored — the display fields (thinking/thinking_seconds) and the thinking/redacted_thinking blocks inside a provider echo (assistant_blocks) — while leaving the echo's text and tool_use blocks intact, so a cleared session neither shows traces nor re-sends them (see GDLLMSessionStore.strip_echo_thinking).
+## Headless regression tests for "Clear Thinking": clearing must strip reasoning from every place it is stored — the display fields (thinking/thinking_seconds) and every provider echo's reasoning blocks inside assistant_blocks (Anthropic's thinking/redacted_thinking, the OpenAI Responses API's reasoning items) — while leaving the echo's text and call blocks intact, so a cleared session neither shows traces nor re-sends them (see GDLLMSessionStore.strip_echo_thinking).
 ## Run from the project root:
 ##   godot --headless --path . --script res://addons/gdllm-godot-agentic-harness/tools/clear_thinking_test.gd
 ## Exits nonzero on any failure. The real user://gdllm/sessions.json is backed up before the store is touched and restored afterward, so running this against a live project loses nothing.
@@ -37,6 +37,13 @@ func _run_tests() -> void:
 			{"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.gd"}},
 		]},
 		{"role": "tool", "tool_name": "read_file", "content": "config_version=5..."},
+		{"role": "assistant", "content": "", "model": "m", "thinking": "SECRET_TRACE_C", "thinking_seconds": 0.5, "tool_calls": [
+			{"function": {"name": "read_file", "arguments": {"path": "b.gd"}}},
+		], "assistant_blocks": [
+			{"type": "reasoning", "id": "rs_1", "summary": [{"type": "summary_text", "text": "SECRET_TRACE_C"}], "encrypted_content": "SECRET_ENCRYPTED"},
+			{"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read_file", "arguments": "{\"path\": \"b.gd\"}"},
+		]},
+		{"role": "tool", "tool_name": "read_file", "content": "extends Node..."},
 		{"role": "assistant", "content": "Done.", "model": "m", "thinking": "SECRET_TRACE_B", "thinking_seconds": 2.0},
 	]
 	var record := {"id": "s_think_1", "title": "Traces", "model": "m", "created": 1, "updated": 2, "is_open": false, "history": history}
@@ -52,6 +59,9 @@ func _run_tests() -> void:
 	_check(blocks.size() == 2, "only the echo's thinking blocks are removed")
 	_check(String(blocks[0].get("type", "")) == "text" and String(blocks[1].get("type", "")) == "tool_use", "the echo keeps its text and tool_use blocks in order")
 	_check(String(blocks[1].get("id", "")) == "toolu_1", "the surviving tool_use keeps its real id for result pairing")
+	var responses_blocks: Array = cleared[3].get("assistant_blocks", [])
+	_check(responses_blocks.size() == 1 and String(responses_blocks[0].get("type", "")) == "function_call", "a Responses echo loses its reasoning item — summary and encrypted content alike — and keeps its function_call")
+	_check(String(responses_blocks[0].get("call_id", "")) == "call_1", "the surviving function_call keeps its real call_id for result pairing")
 	_check(int(store.sessions[0]["updated"]) == 2, "clearing traces does not bump the last-message timestamp")
 	_check(not store.clear_thinking("s_think_1"), "a second clear is a no-op")
 

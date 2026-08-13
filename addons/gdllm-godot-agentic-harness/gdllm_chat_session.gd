@@ -165,6 +165,8 @@ var _compaction_stalled: bool = false ## Set once a compaction event committed n
 var _downshift_notice: Control ## The live "this conversation no longer fits the current model" row, or null while it doesn't apply. Deliberately not a history entry: it states a CONDITION rather than recording an event, so it is re-evaluated and dropped the moment the condition clears (see _refresh_downshift_notice).
 var _no_sources_notice: Control ## The standing "no source enabled" guidance row, or null while at least one source is enabled. A condition like the downshift row — never persisted, re-derived on every sources edit, gone the moment a source is enabled (see _refresh_no_sources_notice).
 var _unknown_window_notice: Control ## The standing "context window unknown" guidance row, or null while the window is known, a probe is still in flight, or a debug threshold stands in. A condition like its siblings above (see _refresh_unknown_window_notice).
+var _chatgpt_signin_notice: Control ## The standing "not signed in" guidance row for a ChatGPT-subscription model, or null while another kind is selected or the source holds a sign-in. A condition like its siblings, but carrying a live Sign in with ChatGPT button so the fix is one click away, not a dialog hunt (see _refresh_chatgpt_signin_notice).
+var _chatgpt_signin_source: String = "" ## The source id the standing sign-in row was built for; a switch to a different unsigned subscription source must rebuild the row, or its label and button would keep signing into the model the session already left.
 var _window_probe_failed := "" ## Qualified id whose latest context-window probe answered with nothing — the "we asked and the source doesn't know" evidence the unknown-window row requires, so it never flashes while a probe is merely still in flight. Cleared by a model switch (the id no longer matches) or a window arriving.
 var _downshift_from: String = "" ## The model this session most recently switched away from, purely so the downshift row can name it; runtime-only, since after a reload there is no swap to attribute.
 
@@ -560,8 +562,9 @@ func _apply_qualified_model(qid: String, switched: bool = false) -> void:
 	var previous := _qualified_model
 	_qualified_model = qid
 	if _effort != "" and not GDLLMEfforts.levels_for(qid).has(_effort):
-		_effort = ""
-		effort_changed.emit(session_id, "")
+		# The new model's own remembered level stands in for the unsupported one — the reset lands where the user actually runs this model, with Default as the floor.
+		_effort = GDLLMEfforts.remembered_level_for(qid)
+		effort_changed.emit(session_id, _effort)
 	_rebuild_effort_options()
 	if is_instance_valid(client):
 		client.configure_from(_resolved_with_effort())
@@ -573,6 +576,7 @@ func _apply_qualified_model(qid: String, switched: bool = false) -> void:
 	_refresh_downshift_notice()
 	_refresh_no_sources_notice() # the dock re-applies the model on every settings change, so a Connections edit lands here
 	_refresh_unknown_window_notice() # and an Effort Configuration edit (declaring or clearing a window) lands here the same way
+	_refresh_chatgpt_signin_notice() # and a sign-in or sign-out (the token store is a setting too) lands here as well
 
 
 ## This session's model identity as a qualified "source::model" id (used by the dock to sync the global default).
@@ -585,7 +589,7 @@ func _apply_record() -> void:
 	var model := String(_record.get("model", ""))
 	if model == "":
 		model = GDLLMSettings.get_chat_model()
-	# Restore the effort selection before the model adoption below reads it, validated silently — a restore never re-persists what it just read; a level the config no longer grants simply shows Default.
+	# Restore the effort selection before the model adoption below reads it, validated silently — a restore never re-persists what it just read; a level the config no longer grants simply shows Default. The record's value is authoritative: a new session was seeded from the model's remembered level at creation (see GDLLMSessionStore._new_record), so restores never consult the memory again.
 	var stored_effort := String(_record.get("effort", ""))
 	_effort = stored_effort if GDLLMEfforts.levels_for(model).has(stored_effort) else ""
 	_apply_qualified_model(model)
@@ -703,6 +707,7 @@ func _replay_history() -> void:
 	_refresh_downshift_notice()
 	_refresh_no_sources_notice()
 	_refresh_unknown_window_notice()
+	_refresh_chatgpt_signin_notice()
 	_send_button.disabled = false
 	_follow_to_bottom()
 
@@ -752,7 +757,7 @@ func _request_content(msg: Dictionary, limit: int) -> String:
 	return String(msg.get("content", ""))
 
 
-## The history index after which an assistant turn's stored provider echo actually rides a request built over the first `limit` messages: Anthropic replays raw blocks only for the trailing tool loop — the tool-call turns after the last user message — and rebuilds every earlier turn from text plus synthesized ids (see AnthropicAdapter._translate_messages). -1 when the span holds no user message, where the whole span is that trailing loop. Ollama and OpenAI never store blocks, so the boundary costs them nothing.
+## The history index after which an assistant turn's stored provider echo actually rides a request built over the first `limit` messages: the echoing providers (Anthropic's raw content blocks, the OpenAI Responses API's output items) replay them only for the trailing tool loop — the tool-call turns after the last user message — and rebuild every earlier turn from text plus synthesized ids (see AnthropicAdapter._translate_messages and OpenAIResponsesAdapter._translate_input, which share this rule). -1 when the span holds no user message, where the whole span is that trailing loop. Ollama and chat-completions OpenAI never store blocks, so the boundary costs them nothing.
 func _echo_boundary(limit: int) -> int:
 	for i in range(mini(limit, _history.size()) - 1, -1, -1):
 		var msg: Variant = _history[i]
@@ -1024,7 +1029,14 @@ func _refresh_context_window() -> void:
 	if _qualified_model == _context_probe_attempted:
 		return
 	_context_probe_attempted = _qualified_model
-	client.fetch_context_window()
+	if not client.fetch_context_window():
+		if client.has_context_probe():
+			# The probe exists but couldn't run (the transport not yet in the tree); un-latch so the next model apply retries, instead of a false "the source doesn't know" settling in.
+			_context_probe_attempted = ""
+		else:
+			# This source's API offers no probe at all (the ChatGPT subscription backend), so no reply will ever land in the handler below — the unknown window is known right now, and the guidance row must say so instead of waiting forever on a probe that never ran.
+			_window_probe_failed = _qualified_model
+			_refresh_unknown_window_notice()
 
 
 ## A context-window probe landed. A reply that outlived a model switch is dropped — the probe names the bare model it asked about, which must still be this session's. A failed probe (0) repaints without caching, so the meter shows ? and the next model apply retries.
@@ -1080,12 +1092,7 @@ func _refresh_no_sources_notice() -> void:
 			any_enabled = true
 			break
 	if any_enabled or not is_instance_valid(_message_list):
-		if is_instance_valid(_no_sources_notice):
-			var parent := _no_sources_notice.get_parent()
-			if parent != null:
-				parent.remove_child(_no_sources_notice) # detach now so the freed row doesn't linger a frame
-			_no_sources_notice.queue_free()
-		_no_sources_notice = null
+		_no_sources_notice = _drop_notice(_no_sources_notice)
 		return
 	if is_instance_valid(_no_sources_notice):
 		return # already up; the condition is unchanged
@@ -1106,12 +1113,7 @@ func _refresh_unknown_window_notice() -> void:
 			and _window_probe_failed == _qualified_model \
 			and GDLLMSettings.get_compaction_debug_override() <= 0
 	if not applies or not is_instance_valid(_message_list):
-		if is_instance_valid(_unknown_window_notice):
-			var parent := _unknown_window_notice.get_parent()
-			if parent != null:
-				parent.remove_child(_unknown_window_notice) # detach now so the freed row doesn't linger a frame
-			_unknown_window_notice.queue_free()
-		_unknown_window_notice = null
+		_unknown_window_notice = _drop_notice(_unknown_window_notice)
 		return
 	if is_instance_valid(_unknown_window_notice):
 		return # already up; the condition is unchanged
@@ -1125,14 +1127,68 @@ func _refresh_unknown_window_notice() -> void:
 	_follow_to_bottom()
 
 
-## Drop the standing downshift row, if one is up. Safe against a log rebuild having freed it already.
-func _clear_downshift_notice() -> void:
-	if is_instance_valid(_downshift_notice):
-		var parent := _downshift_notice.get_parent()
+## Show (or drop) the standing guidance row for a ChatGPT-subscription model without a sign-in: every send would fail until the source is signed in, so the log says so before the first attempt — and carries the sign-in button itself, since the fix is a browser round-trip, not a value to type (goal 3). Ephemeral like its sibling condition rows: never persisted, re-derived on model and settings changes (a sign-in writes the token store, a setting, so completion lands here through the dock's settings hook), and gone the moment the source holds tokens.
+func _refresh_chatgpt_signin_notice() -> void:
+	var resolved := GDLLMSources.resolve_qualified(_qualified_model)
+	var source_id := String(resolved.get("source_id", ""))
+	var applies := String(resolved.get("kind", "")) == GDLLMSources.KIND_OPENAI_CHATGPT \
+			and not bool(resolved.get("stale", false)) \
+			and not GDLLMOAuth.is_signed_in(source_id)
+	if not applies or not is_instance_valid(_message_list):
+		_chatgpt_signin_notice = _drop_notice(_chatgpt_signin_notice)
+		return
+	if is_instance_valid(_chatgpt_signin_notice):
+		if _chatgpt_signin_source == source_id:
+			return # already up for this source; the condition is unchanged
+		_chatgpt_signin_notice = _drop_notice(_chatgpt_signin_notice) # up for a source the session left; rebuild for the current one
+	var row := HBoxContainer.new()
+	row.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_theme_constant_override("separation", 8)
+	var notice := Label.new()
+	notice.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	notice.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_apply_caption_style(notice, GDLLMColors.color(GDLLMColors.WARNING_CAPTION))
+	notice.text = "This model runs on the ChatGPT subscription source \"%s\", which isn't signed in — every send will fail until it is. Sign in here, or from the ⚙ Connections dialog." % source_id
+	row.add_child(notice)
+	var sign_in := Button.new()
+	sign_in.text = "Sign in with ChatGPT"
+	sign_in.pressed.connect(func() -> void:
+		sign_in.disabled = true
+		sign_in.text = "Waiting for the browser…"
+		_start_chatgpt_signin(source_id, notice, sign_in))
+	row.add_child(sign_in)
+	_message_list.add_child(row)
+	_chatgpt_signin_notice = row
+	_chatgpt_signin_source = source_id
+	_follow_to_bottom()
+
+
+## Run one browser sign-in for `source_id` (see GDLLMOAuth.launch). Success writes the token store — a settings write, which also clears this notice through the dock's settings hook — while failure lands its reason on the row's own label, still ephemeral, with the button restored for another try.
+func _start_chatgpt_signin(source_id: String, notice: Label, sign_in: Button) -> void:
+	GDLLMOAuth.launch(self, source_id, func(ok: bool, detail: String) -> void:
+		if ok:
+			_refresh_chatgpt_signin_notice()
+			return
+		if is_instance_valid(notice):
+			notice.text = "Sign-in failed: %s" % detail
+		if is_instance_valid(sign_in):
+			sign_in.disabled = false
+			sign_in.text = "Sign in with ChatGPT")
+
+
+## Drop one standing guidance row, detached immediately so the freed row doesn't linger a frame; returns null for the caller's handle. Safe against a log rebuild having freed it already. Every condition row's teardown routes through here.
+func _drop_notice(notice: Control) -> Control:
+	if is_instance_valid(notice):
+		var parent := notice.get_parent()
 		if parent != null:
-			parent.remove_child(_downshift_notice) # detach now so the freed row doesn't linger a frame
-		_downshift_notice.queue_free()
-	_downshift_notice = null
+			parent.remove_child(notice)
+		notice.queue_free()
+	return null
+
+
+## Drop the standing downshift row, if one is up.
+func _clear_downshift_notice() -> void:
+	_downshift_notice = _drop_notice(_downshift_notice)
 
 
 ## The disclosure a prediction owes about where its reported base came from, merged onto the notice it feeds: a base measured by a model this session has since switched away from is still the truest reading available (a neighbouring tokenizer beats chars-per-token), so it is labelled rather than discarded — every other estimate in this plugin says what it is, and a count quoted against a window the provider that produced it never saw should too. Empty for the ordinary same-model case.
@@ -1594,7 +1650,7 @@ func _favorite_icon() -> Texture2D:
 	return null
 
 
-## The effort picker's selection changed: adopt the level for future requests and let the dock persist it. Metadata "" is Default.
+## The effort picker's selection changed: adopt the level for future requests, let the dock persist it, and remember it as the model's own preference so future sessions on the model open with it. Metadata "" is Default.
 func _on_effort_selected(index: int) -> void:
 	var level := String(_effort_select.get_item_metadata(index))
 	if level == _effort:
@@ -1603,6 +1659,7 @@ func _on_effort_selected(index: int) -> void:
 	if is_instance_valid(client):
 		client.effort = level
 	effort_changed.emit(session_id, level)
+	GDLLMEfforts.remember_level(_qualified_model, level)
 
 
 ## This session's resolved source with its effort selection stamped on — effort rides the resolved Dictionary so the client and any delegated subagent inherit it through the same configure_from path (see _drive_subagent).
@@ -3687,6 +3744,7 @@ func _clear_message_log() -> void:
 	_downshift_notice = null # the standing downshift row lives in _message_list too; a rebuild frees it and _refresh_downshift_notice re-derives it if it still applies
 	_no_sources_notice = null # same for the no-sources guidance row
 	_unknown_window_notice = null # and the unknown-window one
+	_chatgpt_signin_notice = null # and the sign-in one
 	# Same again for a compaction event's live panels: a rebuild replays them from their records, so the handles into the freed nodes must go.
 	_compaction_panel_body = null
 	_compaction_run_body = null

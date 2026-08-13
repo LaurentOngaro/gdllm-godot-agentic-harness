@@ -7,7 +7,7 @@ const MANAGE_COL_DELETE := 11 ## Column in the manage table holding each row's t
 const MANAGE_RESIZE_MARGIN := 5.0 ## Half-width in px of the grab zone around a column boundary in the manage table's title strip.
 const MANAGE_COL_MIN_WIDTH := 40 ## Narrowest a manage-table column can be drag-resized down to.
 const CONNECTION_TOGGLE_WIDTH := 34 ## Fixed width of the Connections dialog's per-source enabled column; the header label and each row's checkbox share it so columns line up (mirrors the delete button's 34px).
-## Per-kind guidance for the Connections dialog's URL field — placeholder for a blank field, tooltip for a filled one. The field takes the URL the provider's own UI hands out, full endpoint or bare base alike (each adapter derives its routes from the server root; see LLMAdapter._root_from_endpoint), so the guidance shows the form users actually copy.
+## Per-kind guidance for the Connections dialog's URL field — placeholder for a blank field, tooltip for a filled one, and for a kind whose endpoint is the same for everyone, the `prefill` a still-blank row adopts on switching to it. The field takes the URL the provider's own UI hands out, full endpoint or bare base alike (each adapter derives its routes from the server root; see LLMAdapter._root_from_endpoint), so the guidance shows the form users actually copy.
 const CONNECTION_BASE_URL_HINTS := {
 	GDLLMSources.KIND_OLLAMA: {
 		"placeholder": "http://localhost:11434",
@@ -17,9 +17,20 @@ const CONNECTION_BASE_URL_HINTS := {
 		"placeholder": "http://localhost:1234/v1/chat/completions",
 		"tooltip": "Paste the URL your server hands out, a full endpoint like http://localhost:1234/v1/chat/completions, a base ending in /v1, or a bare host and port (/v1 is then added automatically) all work.",
 	},
+	GDLLMSources.KIND_OPENAI_RESPONSES: {
+		"placeholder": "https://api.openai.com/v1",
+		"tooltip": "OpenAI's newer Responses API — what GPT-5.6-class models need for reasoning effort with tools. OpenAI's own endpoint is the same for everyone: https://api.openai.com/v1 (pasting the full …/v1/responses endpoint works too). Third-party servers usually speak the OpenAI-Compatible (Chat Completions) kind instead.",
+		"prefill": GDLLMSources.DEFAULT_OPENAI_BASE,
+	},
+	GDLLMSources.KIND_OPENAI_CHATGPT: {
+		"placeholder": "https://chatgpt.com/backend-api/codex",
+		"tooltip": "OpenAI's ChatGPT backend — the same for everyone; your Plus/Pro subscription covers usage, so no API key is needed. Use the Sign in with ChatGPT button instead of a key.",
+		"prefill": GDLLMSources.DEFAULT_CHATGPT_BASE,
+	},
 	GDLLMSources.KIND_ANTHROPIC: {
 		"placeholder": "https://api.anthropic.com",
 		"tooltip": "Anthropic's endpoint is the same for everyone: https://api.anthropic.com — pasting the full …/v1/messages endpoint works too.",
+		"prefill": GDLLMSources.DEFAULT_ANTHROPIC_BASE,
 	},
 }
 const EFFORT_LEVEL_COL_WIDTH := 62 ## Fixed width of each level column in the Effort Configuration table; the header label and each row's checkbox share it so columns line up, wide enough for "minimal".
@@ -607,7 +618,7 @@ func _ensure_connections_dialog() -> void:
 	content.add_theme_constant_override("separation", 8)
 
 	var hint := Label.new()
-	hint.text = "Each source is a place models come from. Kind sets the wire format: Ollama (local or cloud), OpenAI-compatible (LM Studio, llama.cpp, koboldcpp, vLLM, Poolside, most others...), or Anthropic (Claude models). For the URL, paste what your provider hands you — the full endpoint or just the server's address; every route is derived from it. Paste an API key for sources that need one — keys are stored locally in Editor Settings and never committed. Save, then Refresh Models to pull each source's models into the pickers."
+	hint.text = "Each source is a place models come from. Kind sets the wire format and auth: Ollama (local or cloud), OpenAI-Compatible (Chat Completions — LM Studio, llama.cpp, koboldcpp, vLLM, Poolside, most others...), OpenAI Responses API (api.openai.com with an API key), OpenAI ChatGPT Subscription (your Plus/Pro account via Sign in with ChatGPT — no key), or Anthropic (Claude models). For the URL, paste what your provider hands you — the full endpoint or just the server's address; every route is derived from it. Paste an API key for sources that need one — keys (and ChatGPT sign-in tokens) are stored locally in Editor Settings and never committed. Save, then Refresh Models to pull each source's models into the pickers."
 	hint.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	content.add_child(hint)
 
@@ -675,7 +686,7 @@ func _add_connection_row(source: Dictionary) -> void:
 	row.add_child(name_edit)
 
 	var kind_select := OptionButton.new()
-	var kinds: Array = [["Ollama", GDLLMSources.KIND_OLLAMA], ["OpenAI", GDLLMSources.KIND_OPENAI], ["Anthropic", GDLLMSources.KIND_ANTHROPIC]]
+	var kinds: Array = [["Ollama", GDLLMSources.KIND_OLLAMA], ["OpenAI-Compatible (Chat Completions)", GDLLMSources.KIND_OPENAI], ["OpenAI Responses API", GDLLMSources.KIND_OPENAI_RESPONSES], ["OpenAI ChatGPT Subscription", GDLLMSources.KIND_OPENAI_CHATGPT], ["Anthropic", GDLLMSources.KIND_ANTHROPIC]]
 	for i in kinds.size():
 		kind_select.add_item(String(kinds[i][0]))
 		kind_select.set_item_metadata(i, kinds[i][1])
@@ -694,12 +705,6 @@ func _add_connection_row(source: Dictionary) -> void:
 	base_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	base_edit.size_flags_stretch_ratio = 3.0
 	row.add_child(base_edit)
-	kind_select.item_selected.connect(func(index: int) -> void:
-		var kind := String(kind_select.get_item_metadata(index))
-		_apply_base_url_hint(base_edit, kind)
-		# Anthropic's endpoint is the same for everyone, so switching a still-blank row to that kind fills it in — one less thing to look up when adding the source by hand.
-		if base_edit.text.strip_edges() == "" and kind == GDLLMSources.KIND_ANTHROPIC:
-			base_edit.text = GDLLMSources.DEFAULT_ANTHROPIC_BASE)
 
 	var key_edit := LineEdit.new()
 	key_edit.text = String(source.get("api_key", ""))
@@ -708,6 +713,26 @@ func _add_connection_row(source: Dictionary) -> void:
 	key_edit.size_flags_horizontal = Control.SIZE_EXPAND_FILL
 	key_edit.size_flags_stretch_ratio = 2.0
 	row.add_child(key_edit)
+
+	# The subscription kind authenticates with a browser sign-in, not a pasted key, so its rows swap the key field for this button (see _refresh_connection_auth_button).
+	var auth_button := Button.new()
+	auth_button.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	auth_button.size_flags_stretch_ratio = 2.0
+	row.add_child(auth_button)
+
+	var apply_kind := func(kind: String) -> void:
+		_apply_base_url_hint(base_edit, kind)
+		key_edit.visible = kind != GDLLMSources.KIND_OPENAI_CHATGPT
+		auth_button.visible = kind == GDLLMSources.KIND_OPENAI_CHATGPT
+	apply_kind.call(current_kind)
+	_refresh_connection_auth_button(auth_button, String(source.get("id", "")))
+	kind_select.item_selected.connect(func(index: int) -> void:
+		var kind := String(kind_select.get_item_metadata(index))
+		apply_kind.call(kind)
+		# A kind whose endpoint is the same for everyone carries a prefill (see CONNECTION_BASE_URL_HINTS), so switching a still-blank row to it fills the URL in — one less thing to look up when adding the source by hand.
+		var prefill := String(CONNECTION_BASE_URL_HINTS.get(kind, {}).get("prefill", ""))
+		if base_edit.text.strip_edges() == "" and prefill != "":
+			base_edit.text = prefill)
 
 	var del := Button.new()
 	del.custom_minimum_size = Vector2(34, 0)
@@ -723,10 +748,55 @@ func _add_connection_row(source: Dictionary) -> void:
 		"kind_select": kind_select,
 		"base_edit": base_edit,
 		"key_edit": key_edit,
+		"auth_button": auth_button,
 		"container": row,
 	}
 	_connection_rows.append(entry)
 	del.pressed.connect(func() -> void: _remove_connection_row(entry))
+	auth_button.pressed.connect(func() -> void: _on_connection_auth_pressed(entry, auth_button))
+
+
+## Stamp the subscription auth button with its row's sign-in state: an offer to sign in, or the signed-in account with sign-out on click.
+func _refresh_connection_auth_button(auth_button: Button, source_id: String) -> void:
+	if source_id != "" and GDLLMOAuth.is_signed_in(source_id):
+		auth_button.text = "Sign out (%s)" % GDLLMOAuth.account_label(source_id)
+		auth_button.tooltip_text = "Signed in. Click to sign out and forget this source's stored tokens."
+	else:
+		auth_button.text = "Sign in with ChatGPT"
+		auth_button.tooltip_text = "Opens your browser to authorize GDLLM with your ChatGPT account (Plus/Pro) — your subscription covers usage, no API key involved. Tokens are stored in Editor Settings with the same custody as API keys."
+
+
+## The row's sign-in/sign-out click. A fresh unsaved row has no id yet for tokens to key on, so it saves and rebuilds first, then resumes this click on the rebuilt row now carrying the assigned id — one click starts the browser either way. Sign-out is immediate; sign-in runs one GDLLMOAuth flow (see GDLLMOAuth.launch) and restamps the button on completion.
+func _on_connection_auth_pressed(entry: Dictionary, auth_button: Button) -> void:
+	var source_id := String(entry.get("id", ""))
+	if source_id == "":
+		# The save assigns the row its id (a blank name included — _gather_sources falls back to a generated one), so the resume matches on ids that didn't exist before the save, never on the editable name.
+		var known_ids := {}
+		for existing in _connection_rows:
+			if String(existing["id"]) != "":
+				known_ids[String(existing["id"])] = true
+		_save_connections()
+		_refresh_connections_list()
+		for new_entry in _connection_rows:
+			var kind_select: OptionButton = new_entry["kind_select"]
+			if not known_ids.has(String(new_entry["id"])) and String(kind_select.get_item_metadata(kind_select.selected)) == GDLLMSources.KIND_OPENAI_CHATGPT:
+				_on_connection_auth_pressed(new_entry, new_entry["auth_button"])
+				return
+		return
+	if GDLLMOAuth.is_signed_in(source_id):
+		GDLLMOAuth.clear_tokens(source_id)
+		_refresh_connection_auth_button(auth_button, source_id)
+		return
+	auth_button.disabled = true
+	auth_button.text = "Waiting for the browser…"
+	GDLLMOAuth.launch(self, source_id, func(ok: bool, detail: String) -> void:
+		if is_instance_valid(auth_button):
+			auth_button.disabled = false
+			_refresh_connection_auth_button(auth_button, source_id)
+			if not ok:
+				auth_button.tooltip_text = "Sign-in failed: %s" % detail
+		if not ok:
+			push_warning("GDLLM: ChatGPT sign-in failed: %s" % detail))
 
 
 ## Stamp `base_edit` with `kind`'s URL guidance (see CONNECTION_BASE_URL_HINTS) — the placeholder shows on a blank field, the tooltip on hover either way. Re-applied whenever the row's kind changes, so the guidance always describes the selected wire format.
@@ -789,7 +859,7 @@ func _on_connections_confirmed() -> void:
 
 func _on_connections_custom_action(action: StringName) -> void:
 	if action == "add_source":
-		# Fresh rows default to the OpenAI kind
+		# Fresh rows default to the OpenAI-Compatible kind — the common case when adding a third-party server by hand
 		_add_connection_row({"kind": GDLLMSources.KIND_OPENAI})
 	elif action == "refresh_models":
 		_save_connections() # persist edits first so the sweep hits the current URLs and keys
@@ -1485,7 +1555,7 @@ func _thinking_size(record: Dictionary) -> int:
 			bytes += String(msg["thinking"]).to_utf8_buffer().size()
 		if msg.get("assistant_blocks") is Array:
 			for block in msg["assistant_blocks"]:
-				if block is Dictionary and String(block.get("type", "")) in ["thinking", "redacted_thinking"]:
+				if block is Dictionary and String(block.get("type", "")) in GDLLMSessionStore.ECHO_THINKING_TYPES:
 					bytes += JSON.stringify(block).to_utf8_buffer().size()
 	return bytes
 
